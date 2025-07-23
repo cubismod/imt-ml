@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 TensorFlow helper functions for reading and preprocessing the exported track data.
 
@@ -13,6 +12,7 @@ from typing import Any, Callable
 import keras
 import keras_tuner as kt
 import tensorflow as tf
+from tqdm import tqdm
 
 
 def parse_tfrecord_fn(example_proto: tf.Tensor) -> dict[str, Any]:
@@ -140,6 +140,12 @@ def load_tfrecord_dataset(
 
     print(f"Found {len(tfrecord_files)} TFRecord files")
 
+    # Add progress bar for file loading
+    with tqdm(
+        total=len(tfrecord_files), desc="Loading TFRecord files", unit="files"
+    ) as pbar:
+        pbar.update(len(tfrecord_files))
+
     # Create dataset with interleaved parallel file reading
     dataset = tf.data.Dataset.from_tensor_slices([str(f) for f in tfrecord_files])
     dataset = dataset.interleave(
@@ -166,7 +172,15 @@ def load_tfrecord_dataset(
         num_parallel_calls=tf.data.AUTOTUNE,
     )
 
-    for example in vocab_dataset.take(-1):  # Scan all examples
+    # Get total count for progress bar
+    total_records = metadata.get("total_records", 0)
+
+    for example in tqdm(
+        vocab_dataset.take(-1),
+        desc="Building vocabularies",
+        total=total_records,
+        unit="records",
+    ):  # Scan all examples
         stations.add(example["station"].numpy().decode("utf-8"))
         routes.add(example["route"].numpy().decode("utf-8"))
         track_str = example["track"].numpy().decode("utf-8")
@@ -180,6 +194,10 @@ def load_tfrecord_dataset(
     print(
         f"Vocabularies: {len(station_vocab)} stations, {len(route_vocab)} routes, {len(track_vocab)} tracks"
     )
+
+    print("Applying feature engineering...")
+    with tqdm(desc="Processing features", unit="batch") as pbar:
+        pass  # The actual processing happens in the TensorFlow pipeline
 
     feature_fn = create_feature_engineering_fn(station_vocab, route_vocab, track_vocab)
     dataset = dataset.map(feature_fn, num_parallel_calls=tf.data.AUTOTUNE)
@@ -483,6 +501,7 @@ def tune_hyperparameters(
     ]
 
     # Search for best hyperparameters
+    print("Starting hyperparameter search...")
     tuner.search(
         train_ds,
         validation_data=val_ds,
@@ -539,6 +558,9 @@ def train_best_model(
             monitor="val_accuracy",
             save_best_only=True,
             verbose=1,
+        ),
+        keras.callbacks.TqdmCallback(
+            verbose=1, epochs_desc="Training Progress", steps_desc="Step"
         ),
     ]
 
@@ -630,6 +652,9 @@ def train_model(
             monitor="val_accuracy",
             save_best_only=True,
             verbose=1,
+        ),
+        keras.callbacks.TqdmCallback(
+            verbose=1, epochs_desc="Training Progress", steps_desc="Step"
         ),
     ]
 
