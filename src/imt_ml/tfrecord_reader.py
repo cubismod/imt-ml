@@ -375,7 +375,7 @@ def _create_tunable_embedding_layers(
 
 def _create_tunable_dense_layers(x: tf.Tensor, hp: kt.HyperParameters) -> tf.Tensor:
     """Create tunable dense layers with hyperparameter optimization."""
-    num_layers = hp.Int("num_layers", min_value=2, max_value=10)
+    num_layers = hp.Int("num_layers", min_value=5, max_value=40)
 
     for i in range(num_layers):
         units = hp.Int(f"units_{i}", min_value=32, max_value=256, step=32)
