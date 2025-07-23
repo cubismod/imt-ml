@@ -19,3 +19,5 @@ tasks:
     - uv run mypy src tests devtools
   export-track-data:
     - uv run export-track-data --output ./track_data_export
+  train-model:
+    - uv run src/imt_ml/tfrecord_reader.py

@@ -6,7 +6,6 @@ all historical track assignment data into TFRecord files suitable for TensorFlow
 training.
 """
 
-from typing import Any
 import argparse
 import asyncio
 import json
@@ -157,8 +156,8 @@ class TrackDataExporter:
         records_per_file: int = 10000,
     ) -> None:
         """Write assignments to TFRecord files."""
-        output_dir: Path = (
-            Path(output_path) / datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        output_dir: Path = Path(output_path) / datetime.now().strftime(
+            "%Y-%m-%d_%H%M%S"
         )
         output_dir.mkdir(parents=True, exist_ok=True)
 

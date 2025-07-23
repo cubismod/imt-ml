@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import keras
+import keras_tuner as kt
 import tensorflow as tf
 
 
@@ -181,9 +182,13 @@ def load_tfrecord_dataset(
     train_dataset = dataset.take(train_size)
     val_dataset = dataset.skip(train_size)
 
-    # Batch and prefetch
-    train_dataset = train_dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-    val_dataset = val_dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    # Batch and prefetch with repeat for small datasets
+    train_dataset = train_dataset.repeat().batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    val_dataset = val_dataset.repeat().batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    # Calculate steps per epoch
+    train_steps_per_epoch = max(1, train_size // batch_size)
+    val_steps_per_epoch = max(1, (total_size - train_size) // batch_size)
 
     # Create vocab info for model building
     vocab_info = {
@@ -194,6 +199,8 @@ def load_tfrecord_dataset(
         "num_routes": len(route_vocab),
         "num_tracks": len(track_vocab),
         "metadata": metadata,
+        "train_steps_per_epoch": train_steps_per_epoch,
+        "val_steps_per_epoch": val_steps_per_epoch,
     }
 
     return train_dataset, val_dataset, vocab_info
@@ -253,7 +260,16 @@ def create_simple_model(vocab_info: dict[str, Any]) -> Any:
     direction_emb = keras.layers.Flatten()(direction_emb)
 
     # Normalize timestamp
-    timestamp_norm: tf.Tensor = keras.layers.Normalization()(timestamp_input)
+    timestamp_norm: tf.Tensor = keras.layers.Normalization(axis=None)(timestamp_input)
+
+    # Expand scalar features to match embedding dimensions
+    hour_sin_expanded = keras.layers.Reshape((1,))(hour_sin_input)
+    hour_cos_expanded = keras.layers.Reshape((1,))(hour_cos_input)
+    minute_sin_expanded = keras.layers.Reshape((1,))(minute_sin_input)
+    minute_cos_expanded = keras.layers.Reshape((1,))(minute_cos_input)
+    day_sin_expanded = keras.layers.Reshape((1,))(day_sin_input)
+    day_cos_expanded = keras.layers.Reshape((1,))(day_cos_input)
+    timestamp_expanded = keras.layers.Reshape((1,))(timestamp_norm)
 
     # Concatenate all features
     concat_features: tf.Tensor = keras.layers.Concatenate()(
@@ -261,13 +277,13 @@ def create_simple_model(vocab_info: dict[str, Any]) -> Any:
             station_emb,
             route_emb,
             direction_emb,
-            hour_sin_input,
-            hour_cos_input,
-            minute_sin_input,
-            minute_cos_input,
-            day_sin_input,
-            day_cos_input,
-            timestamp_norm,
+            hour_sin_expanded,
+            hour_cos_expanded,
+            minute_sin_expanded,
+            minute_cos_expanded,
+            day_sin_expanded,
+            day_cos_expanded,
+            timestamp_expanded,
         ]
     )
 
@@ -302,31 +318,470 @@ def create_simple_model(vocab_info: dict[str, Any]) -> Any:
     return model
 
 
-if __name__ == "__main__":
-    # Example usage
-    import sys
+def build_tunable_model(
+    hp: kt.HyperParameters, vocab_info: dict[str, Any]
+) -> keras.Model:
+    """Create a tunable neural network for track prediction with hyperparameter optimization."""
 
-    if len(sys.argv) != 2:
-        print("Usage: python tfrecord_reader.py <path_to_exported_data>")
-        sys.exit(1)
+    # Input layers
+    station_input: tf.Tensor = keras.layers.Input(
+        shape=(), name="station_id", dtype=tf.int64
+    )
+    route_input: tf.Tensor = keras.layers.Input(
+        shape=(), name="route_id", dtype=tf.int64
+    )
+    direction_input: tf.Tensor = keras.layers.Input(
+        shape=(), name="direction_id", dtype=tf.int64
+    )
 
-    data_dir = sys.argv[1]
+    # Time features
+    hour_sin_input: tf.Tensor = keras.layers.Input(
+        shape=(), name="hour_sin", dtype=tf.float32
+    )
+    hour_cos_input: tf.Tensor = keras.layers.Input(
+        shape=(), name="hour_cos", dtype=tf.float32
+    )
+    minute_sin_input: tf.Tensor = keras.layers.Input(
+        shape=(), name="minute_sin", dtype=tf.float32
+    )
+    minute_cos_input: tf.Tensor = keras.layers.Input(
+        shape=(), name="minute_cos", dtype=tf.float32
+    )
+    day_sin_input: tf.Tensor = keras.layers.Input(
+        shape=(), name="day_sin", dtype=tf.float32
+    )
+    day_cos_input: tf.Tensor = keras.layers.Input(
+        shape=(), name="day_cos", dtype=tf.float32
+    )
+    timestamp_input: tf.Tensor = keras.layers.Input(
+        shape=(), name="scheduled_timestamp", dtype=tf.float32
+    )
+
+    # Tunable embedding dimensions
+    station_emb_dim = hp.Int("station_embedding_dim", min_value=8, max_value=32, step=8)
+    route_emb_dim = hp.Int("route_embedding_dim", min_value=4, max_value=16, step=4)
+    direction_emb_dim = hp.Int(
+        "direction_embedding_dim", min_value=2, max_value=8, step=2
+    )
+
+    # Embeddings for categorical features
+    station_emb: tf.Tensor = keras.layers.Embedding(
+        vocab_info["num_stations"] + 1, station_emb_dim
+    )(station_input)
+    station_emb = keras.layers.Flatten()(station_emb)
+
+    route_emb: tf.Tensor = keras.layers.Embedding(
+        vocab_info["num_routes"] + 1, route_emb_dim
+    )(route_input)
+    route_emb = keras.layers.Flatten()(route_emb)
+
+    direction_emb: tf.Tensor = keras.layers.Embedding(3, direction_emb_dim)(
+        direction_input
+    )
+    direction_emb = keras.layers.Flatten()(direction_emb)
+
+    # Normalize timestamp
+    timestamp_norm: tf.Tensor = keras.layers.Normalization(axis=None)(timestamp_input)
+
+    # Expand scalar features to match embedding dimensions
+    hour_sin_expanded = keras.layers.Reshape((1,))(hour_sin_input)
+    hour_cos_expanded = keras.layers.Reshape((1,))(hour_cos_input)
+    minute_sin_expanded = keras.layers.Reshape((1,))(minute_sin_input)
+    minute_cos_expanded = keras.layers.Reshape((1,))(minute_cos_input)
+    day_sin_expanded = keras.layers.Reshape((1,))(day_sin_input)
+    day_cos_expanded = keras.layers.Reshape((1,))(day_cos_input)
+    timestamp_expanded = keras.layers.Reshape((1,))(timestamp_norm)
+
+    # Concatenate all features
+    concat_features: tf.Tensor = keras.layers.Concatenate()(
+        [
+            station_emb,
+            route_emb,
+            direction_emb,
+            hour_sin_expanded,
+            hour_cos_expanded,
+            minute_sin_expanded,
+            minute_cos_expanded,
+            day_sin_expanded,
+            day_cos_expanded,
+            timestamp_expanded,
+        ]
+    )
+
+    # Tunable dense layers
+    x = concat_features
+    num_layers = hp.Int("num_layers", min_value=2, max_value=4)
+    for i in range(num_layers):
+        units = hp.Int(f"units_{i}", min_value=32, max_value=256, step=32)
+        x = keras.layers.Dense(units, activation="relu")(x)
+
+        dropout_rate = hp.Float(f"dropout_{i}", min_value=0.1, max_value=0.5, step=0.1)
+        x = keras.layers.Dropout(dropout_rate)(x)
+
+    # Output layer
+    outputs: tf.Tensor = keras.layers.Dense(
+        vocab_info["num_tracks"], activation="softmax"
+    )(x)
+
+    # Create model
+    model = keras.Model(
+        inputs=[
+            station_input,
+            route_input,
+            direction_input,
+            hour_sin_input,
+            hour_cos_input,
+            minute_sin_input,
+            minute_cos_input,
+            day_sin_input,
+            day_cos_input,
+            timestamp_input,
+        ],
+        outputs=outputs,
+    )
+
+    # Tunable learning rate
+    learning_rate = hp.Float(
+        "learning_rate", min_value=1e-4, max_value=1e-2, sampling="log"
+    )
+    optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
+
+    model.compile(
+        optimizer=optimizer,
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+
+    return model
+
+
+def tune_hyperparameters(
+    data_dir: str,
+    project_name: str = "track_prediction_tuning",
+    max_trials: int = 20,
+    epochs_per_trial: int = 10,
+    batch_size: int = 32,
+) -> kt.Tuner:
+    """Tune hyperparameters using Keras Tuner."""
 
     # Load dataset
-    train_ds, val_ds, vocab_info = load_tfrecord_dataset(data_dir)
+    print(f"Loading dataset from {data_dir}...")
+    train_ds, val_ds, vocab_info = load_tfrecord_dataset(
+        data_dir, batch_size=batch_size
+    )
 
-    print(f"Train dataset: {train_ds}")
-    print(f"Validation dataset: {val_ds}")
-    print(f"Vocabulary info: {vocab_info}")
+    print("Vocabulary sizes:")
+    print(f"  Stations: {vocab_info['num_stations']}")
+    print(f"  Routes: {vocab_info['num_routes']}")
+    print(f"  Tracks: {vocab_info['num_tracks']}")
+
+    # Create tuner
+    tuner = kt.RandomSearch(
+        hypermodel=lambda hp: build_tunable_model(hp, vocab_info),
+        objective="val_accuracy",
+        max_trials=max_trials,
+        project_name=project_name,
+        overwrite=True,
+    )
+
+    print(f"Starting hyperparameter tuning with {max_trials} trials...")
+    print("Search space:")
+    tuner.search_space_summary()
+
+    # Setup callbacks for tuning
+    callbacks = [
+        keras.callbacks.EarlyStopping(
+            monitor="val_loss", patience=5, restore_best_weights=True, verbose=0
+        ),
+    ]
+
+    # Search for best hyperparameters
+    tuner.search(
+        train_ds,
+        validation_data=val_ds,
+        epochs=epochs_per_trial,
+        steps_per_epoch=vocab_info["train_steps_per_epoch"],
+        validation_steps=vocab_info["val_steps_per_epoch"],
+        callbacks=callbacks,
+        verbose=1,
+    )
+
+    # Print results
+    print("\nTuning completed!")
+    print("Best hyperparameters:")
+    best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
+    for param in best_hps.space:
+        print(f"  {param.name}: {best_hps.get(param.name)}")
+
+    return tuner
+
+
+def train_best_model(
+    tuner: kt.Tuner,
+    data_dir: str,
+    epochs: int = 50,
+    batch_size: int = 32,
+    model_save_path: str = "track_prediction_model_tuned",
+) -> keras.Model:
+    """Train the best model found by hyperparameter tuning."""
+
+    # Load dataset
+    print(f"Loading dataset from {data_dir}...")
+    train_ds, val_ds, vocab_info = load_tfrecord_dataset(
+        data_dir, batch_size=batch_size
+    )
+
+    # Get best hyperparameters and build model
+    best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
+    model = build_tunable_model(best_hps, vocab_info)
+
+    print("Training best model with hyperparameters:")
+    for param in best_hps.space:
+        print(f"  {param.name}: {best_hps.get(param.name)}")
+
+    print(model.summary())
+
+    # Setup callbacks
+    # callbacks = [
+    #     keras.callbacks.EarlyStopping(
+    #         monitor="val_loss", patience=10, restore_best_weights=True, verbose=1
+    #     ),
+    #     keras.callbacks.ReduceLROnPlateau(
+    #         monitor="val_loss", factor=0.5, patience=5, min_lr=1e-7, verbose=1
+    #     ),
+    #     keras.callbacks.ModelCheckpoint(
+    #         filepath=f"{model_save_path}_best.keras",
+    #         monitor="val_accuracy",
+    #         save_best_only=True,
+    #         verbose=1,
+    #     ),
+    # ]
+
+    # Train model
+    print(f"Training model for {epochs} epochs...")
+    # history = model.fit(
+    #     train_ds,
+    #     validation_data=val_ds,
+    #     epochs=epochs,
+    #     steps_per_epoch=vocab_info["train_steps_per_epoch"],
+    #     validation_steps=vocab_info["val_steps_per_epoch"],
+    #     callbacks=callbacks,
+    #     verbose=1,
+    # )
+
+    # Save final model
+    model.save(f"{model_save_path}_final.keras")
+    print(f"Model saved to {model_save_path}_final.keras")
+
+    # Save hyperparameters and vocabulary info
+    save_path = f"{model_save_path}_config.json"
+    config = {
+        "hyperparameters": {
+            param.name: best_hps.get(param.name) for param in best_hps.space
+        },
+        "vocabulary": {
+            "station_vocab": vocab_info["station_vocab"],
+            "route_vocab": vocab_info["route_vocab"],
+            "track_vocab": vocab_info["track_vocab"],
+            "num_stations": vocab_info["num_stations"],
+            "num_routes": vocab_info["num_routes"],
+            "num_tracks": vocab_info["num_tracks"],
+        },
+    }
+    with open(save_path, "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"Configuration saved to {save_path}")
+
+    # Evaluate model
+    print("\nFinal evaluation:")
+    val_loss, val_accuracy = model.evaluate(val_ds, verbose=0)
+    print(f"Validation Loss: {val_loss:.4f}")
+    print(f"Validation Accuracy: {val_accuracy:.4f}")
+
+    return model
+
+
+def train_model(
+    data_dir: str,
+    epochs: int = 50,
+    batch_size: int = 32,
+    learning_rate: float = 0.001,
+    model_save_path: str = "track_prediction_model",
+) -> Any:
+    """Train the track prediction model with proper callbacks and saving."""
+
+    # Load dataset
+    print(f"Loading dataset from {data_dir}...")
+    train_ds, val_ds, vocab_info = load_tfrecord_dataset(
+        data_dir, batch_size=batch_size
+    )
+
+    print("Vocabulary sizes:")
+    print(f"  Stations: {vocab_info['num_stations']}")
+    print(f"  Routes: {vocab_info['num_routes']}")
+    print(f"  Tracks: {vocab_info['num_tracks']}")
 
     # Create and compile model
+    print("Creating model...")
     model = create_simple_model(vocab_info)
+
+    optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
     model.compile(
-        optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"]
+        optimizer=optimizer,
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
     )
 
     print(model.summary())
 
-    # Train for a few epochs as demo
-    print("Training model for 3 epochs...")
-    model.fit(train_ds, validation_data=val_ds, epochs=3)
+    # Setup callbacks
+    callbacks = [
+        keras.callbacks.EarlyStopping(
+            monitor="val_loss", patience=10, restore_best_weights=True, verbose=1
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5, patience=5, min_lr=1e-7, verbose=1
+        ),
+        keras.callbacks.ModelCheckpoint(
+            filepath=f"{model_save_path}_best.keras",
+            monitor="val_accuracy",
+            save_best_only=True,
+            verbose=1,
+        ),
+    ]
+
+    # Train model
+    print(f"Training model for {epochs} epochs...")
+    history = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=epochs,
+        steps_per_epoch=vocab_info["train_steps_per_epoch"],
+        validation_steps=vocab_info["val_steps_per_epoch"],
+        callbacks=callbacks,
+        verbose=1,
+    )
+
+    # Save final model
+    model.save(f"{model_save_path}_final.keras")
+    print(f"Model saved to {model_save_path}_final.keras")
+
+    # Save vocabulary info
+    vocab_save_path = f"{model_save_path}_vocab.json"
+    with open(vocab_save_path, "w") as f:
+        json.dump(
+            {
+                "station_vocab": vocab_info["station_vocab"],
+                "route_vocab": vocab_info["route_vocab"],
+                "track_vocab": vocab_info["track_vocab"],
+                "num_stations": vocab_info["num_stations"],
+                "num_routes": vocab_info["num_routes"],
+                "num_tracks": vocab_info["num_tracks"],
+            },
+            f,
+            indent=2,
+        )
+    print(f"Vocabulary saved to {vocab_save_path}")
+
+    # Evaluate model
+    print("\nFinal evaluation:")
+    val_loss, val_accuracy = model.evaluate(val_ds, verbose=0)
+    print(f"Validation Loss: {val_loss:.4f}")
+    print(f"Validation Accuracy: {val_accuracy:.4f}")
+
+    return history
+
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(description="Train track prediction model")
+    parser.add_argument("data_dir", help="Path to exported TFRecord data")
+
+    # Add subcommands for different training modes
+    subparsers = parser.add_subparsers(dest="command", help="Training mode")
+
+    # Standard training command
+    train_parser = subparsers.add_parser(
+        "train", help="Train model with fixed hyperparameters"
+    )
+    train_parser.add_argument(
+        "--epochs", type=int, default=50, help="Number of training epochs"
+    )
+    train_parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
+    train_parser.add_argument(
+        "--learning-rate", type=float, default=0.001, help="Learning rate"
+    )
+    train_parser.add_argument(
+        "--model-path", default="track_prediction_model", help="Model save path prefix"
+    )
+
+    # Hyperparameter tuning command
+    tune_parser = subparsers.add_parser(
+        "tune", help="Tune hyperparameters and train best model"
+    )
+    tune_parser.add_argument(
+        "--max-trials", type=int, default=20, help="Maximum number of tuning trials"
+    )
+    tune_parser.add_argument(
+        "--epochs-per-trial",
+        type=int,
+        default=10,
+        help="Epochs per trial during tuning",
+    )
+    tune_parser.add_argument(
+        "--final-epochs", type=int, default=50, help="Epochs for final training"
+    )
+    tune_parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
+    tune_parser.add_argument(
+        "--project-name",
+        default="track_prediction_tuning",
+        help="Keras Tuner project name",
+    )
+    tune_parser.add_argument(
+        "--model-path",
+        default="track_prediction_model_tuned",
+        help="Model save path prefix",
+    )
+
+    # Set default command to train for backward compatibility
+    args = parser.parse_args()
+    if args.command is None:
+        # If no subcommand provided, default to training with old behavior
+        args.command = "train"
+        args.epochs = 50
+        args.batch_size = 32
+        args.learning_rate = 0.001
+        args.model_path = "track_prediction_model"
+
+    try:
+        if args.command == "train":
+            train_model(
+                data_dir=args.data_dir,
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+                learning_rate=args.learning_rate,
+                model_save_path=args.model_path,
+            )
+        elif args.command == "tune":
+            # First tune hyperparameters
+            tuner = tune_hyperparameters(
+                data_dir=args.data_dir,
+                project_name=args.project_name,
+                max_trials=args.max_trials,
+                epochs_per_trial=args.epochs_per_trial,
+                batch_size=args.batch_size,
+            )
+
+            # Then train the best model
+            train_best_model(
+                tuner=tuner,
+                data_dir=args.data_dir,
+                epochs=args.final_epochs,
+                batch_size=args.batch_size,
+                model_save_path=args.model_path,
+            )
+    except Exception as e:
+        print(f"Error during {args.command}: {e}")
+        sys.exit(1)

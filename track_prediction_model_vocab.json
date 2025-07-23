@@ -1,0 +1,43 @@
+{
+  "station_vocab": [
+    "place-NEC-1851",
+    "place-NHRML-0055",
+    "place-bbsta",
+    "place-north",
+    "place-rugg",
+    "place-sstat"
+  ],
+  "route_vocab": [
+    "CR-Fairmount",
+    "CR-Fitchburg",
+    "CR-Franklin",
+    "CR-Greenbush",
+    "CR-Haverhill",
+    "CR-Kingston",
+    "CR-Lowell",
+    "CR-Needham",
+    "CR-NewBedford",
+    "CR-Newburyport",
+    "CR-Providence",
+    "CR-Worcester"
+  ],
+  "track_vocab": [
+    "1",
+    "10",
+    "11",
+    "12",
+    "13",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+    "Commuter Rail"
+  ],
+  "num_stations": 6,
+  "num_routes": 12,
+  "num_tracks": 14
+}
