@@ -1,0 +1,21 @@
+version: '3'
+dotenv: [.env]
+
+tasks:
+  check:
+    - uv run ruff check src
+    - uv run ruff check tests
+  fix:
+    - uv run ruff check --fix src
+    - uv run ruff check --fix tests
+  format:
+    - uv run ruff format src
+    - uv run ruff format tests
+  download-types:
+      desc: Generate TypeScript types from Python types
+      cmds:
+        - wget -O src/imt_ml/shared_types.py https://raw.githubusercontent.com/cubismod/inky-mbta-tracker/refs/heads/main/inky-mbta-tracker/shared_types/shared_types.py
+  typecheck:
+    - uv run mypy src tests devtools
+  export-track-data:
+    - uv run export-track-data --output ./track_data_export
