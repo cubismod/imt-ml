@@ -414,13 +414,14 @@ def build_tunable_model(
 def tune_hyperparameters(
     data_dir: str,
     project_name: str = "track_prediction_tuning",
-    max_trials: int = 20,
-    epochs_per_trial: int = 10,
+    max_epochs: int = 50,
+    factor: int = 3,
+    hyperband_iterations: int = 1,
     batch_size: int = 32,
     distributed: bool = False,
     executions_per_trial: int = 2,
 ) -> kt.Tuner:
-    """Tune hyperparameters using Keras Tuner."""
+    """Tune hyperparameters using Keras Tuner Hyperband algorithm."""
 
     # Load dataset
     print(f"Loading dataset from {data_dir}...")
@@ -436,26 +437,32 @@ def tune_hyperparameters(
     if distributed:
         strategy = tf.distribute.MultiWorkerMirroredStrategy()
         with strategy.scope():
-            tuner = kt.RandomSearch(
+            tuner = kt.Hyperband(
                 hypermodel=lambda hp: build_tunable_model(hp, vocab_info),
                 objective="val_accuracy",
+                max_epochs=max_epochs,
+                factor=factor,
+                hyperband_iterations=hyperband_iterations,
                 executions_per_trial=executions_per_trial,
-                max_trials=max_trials,
                 project_name=project_name,
                 overwrite=True,
                 distribution_strategy=strategy,
             )
     else:
-        tuner = kt.RandomSearch(
+        tuner = kt.Hyperband(
             hypermodel=lambda hp: build_tunable_model(hp, vocab_info),
             objective="val_accuracy",
+            max_epochs=max_epochs,
+            factor=factor,
+            hyperband_iterations=hyperband_iterations,
             executions_per_trial=executions_per_trial,
-            max_trials=max_trials,
             project_name=project_name,
             overwrite=True,
         )
 
-    print(f"Starting hyperparameter tuning with {max_trials} trials...")
+    print(
+        f"Starting Hyperband hyperparameter tuning with max_epochs={max_epochs}, factor={factor}..."
+    )
     print("Search space:")
     tuner.search_space_summary()
 
@@ -479,7 +486,6 @@ def tune_hyperparameters(
     tuner.search(
         train_ds,
         validation_data=val_ds,
-        epochs=epochs_per_trial,
         steps_per_epoch=vocab_info["train_steps_per_epoch"],
         validation_steps=vocab_info["val_steps_per_epoch"],
         callbacks=callbacks,
@@ -696,16 +702,26 @@ if __name__ == "__main__":
 
     # Hyperparameter tuning command
     tune_parser = subparsers.add_parser(
-        "tune", help="Tune hyperparameters and train best model"
+        "tune",
+        help="Tune hyperparameters using Hyperband algorithm and train best model",
     )
     tune_parser.add_argument(
-        "--max-trials", type=int, default=20, help="Maximum number of tuning trials"
-    )
-    tune_parser.add_argument(
-        "--epochs-per-trial",
+        "--max-epochs",
         type=int,
-        default=10,
-        help="Epochs per trial during tuning",
+        default=50,
+        help="Maximum epochs for Hyperband algorithm",
+    )
+    tune_parser.add_argument(
+        "--factor",
+        type=int,
+        default=3,
+        help="Hyperband reduction factor",
+    )
+    tune_parser.add_argument(
+        "--hyperband-iterations",
+        type=int,
+        default=1,
+        help="Number of Hyperband iterations",
     )
     tune_parser.add_argument(
         "--final-epochs", type=int, default=50, help="Epochs for final training"
@@ -755,8 +771,9 @@ if __name__ == "__main__":
             tuner = tune_hyperparameters(
                 data_dir=args.data_dir,
                 project_name=args.project_name,
-                max_trials=args.max_trials,
-                epochs_per_trial=args.epochs_per_trial,
+                max_epochs=args.max_epochs,
+                factor=args.factor,
+                hyperband_iterations=args.hyperband_iterations,
                 batch_size=args.batch_size,
                 distributed=args.distributed,
                 executions_per_trial=args.executions_per_trial,
