@@ -140,20 +140,36 @@ def load_tfrecord_dataset(
 
     print(f"Found {len(tfrecord_files)} TFRecord files")
 
-    # Create dataset
-    dataset = tf.data.TFRecordDataset([str(f) for f in tfrecord_files])
+    # Create dataset with interleaved parallel file reading
+    dataset = tf.data.Dataset.from_tensor_slices([str(f) for f in tfrecord_files])
+    dataset = dataset.interleave(
+        tf.data.TFRecordDataset,
+        cycle_length=min(len(tfrecord_files), tf.data.AUTOTUNE),
+        num_parallel_calls=tf.data.AUTOTUNE,
+        deterministic=False,  # Allow reordering for better performance
+    )
     dataset = dataset.map(parse_tfrecord_fn, num_parallel_calls=tf.data.AUTOTUNE)
 
-    # Build vocabularies by scanning the dataset
+    # Build vocabularies by scanning the dataset in parallel
     print("Building vocabularies...")
     stations = set()
     routes = set()
     tracks = set()
 
-    for example in dataset.take(-1):  # Scan all examples
-        stations.add(example["station_id"].numpy().decode("utf-8"))
-        routes.add(example["route_id"].numpy().decode("utf-8"))
-        track_str = example["track_number"].numpy().decode("utf-8")
+    # Use parallel map to collect vocabulary items
+    vocab_dataset = dataset.map(
+        lambda x: {
+            "station": x["station_id"],
+            "route": x["route_id"],
+            "track": x["track_number"],
+        },
+        num_parallel_calls=tf.data.AUTOTUNE,
+    )
+
+    for example in vocab_dataset.take(-1):  # Scan all examples
+        stations.add(example["station"].numpy().decode("utf-8"))
+        routes.add(example["route"].numpy().decode("utf-8"))
+        track_str = example["track"].numpy().decode("utf-8")
         if track_str:  # Only add non-empty tracks
             tracks.add(track_str)
 
@@ -165,26 +181,31 @@ def load_tfrecord_dataset(
         f"Vocabularies: {len(station_vocab)} stations, {len(route_vocab)} routes, {len(track_vocab)} tracks"
     )
 
-    # Apply feature engineering
     feature_fn = create_feature_engineering_fn(station_vocab, route_vocab, track_vocab)
     dataset = dataset.map(feature_fn, num_parallel_calls=tf.data.AUTOTUNE)
-
-    # Filter out examples with empty track numbers (target = vocab_size means OOV/empty)
     dataset = dataset.filter(lambda x, y: y < len(track_vocab))
 
-    # Split train/validation
     total_size = metadata["total_records"]
     train_size = int(total_size * train_split)
 
-    # Shuffle before split
-    dataset = dataset.shuffle(shuffle_buffer, reshuffle_each_iteration=False)
+    dataset = dataset.shuffle(
+        min(shuffle_buffer, total_size), reshuffle_each_iteration=False
+    )
 
     train_dataset = dataset.take(train_size)
     val_dataset = dataset.skip(train_size)
 
-    # Batch and prefetch with repeat for small datasets
-    train_dataset = train_dataset.repeat().batch(batch_size).prefetch(tf.data.AUTOTUNE)
-    val_dataset = val_dataset.repeat().batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    train_dataset = (
+        train_dataset.repeat()
+        .batch(batch_size, drop_remainder=True)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    val_dataset = (
+        val_dataset.repeat()
+        .batch(batch_size, drop_remainder=True)
+        .prefetch(tf.data.AUTOTUNE)
+    )
 
     # Calculate steps per epoch
     train_steps_per_epoch = max(1, train_size // batch_size)
@@ -358,10 +379,10 @@ def build_tunable_model(
     )
 
     # Tunable embedding dimensions
-    station_emb_dim = hp.Int("station_embedding_dim", min_value=8, max_value=32, step=8)
-    route_emb_dim = hp.Int("route_embedding_dim", min_value=4, max_value=16, step=4)
+    station_emb_dim = hp.Int("station_embedding_dim", min_value=8, max_value=64, step=8)
+    route_emb_dim = hp.Int("route_embedding_dim", min_value=4, max_value=64, step=4)
     direction_emb_dim = hp.Int(
-        "direction_embedding_dim", min_value=2, max_value=8, step=2
+        "direction_embedding_dim", min_value=2, max_value=32, step=2
     )
 
     # Embeddings for categorical features
@@ -410,7 +431,7 @@ def build_tunable_model(
 
     # Tunable dense layers
     x = concat_features
-    num_layers = hp.Int("num_layers", min_value=2, max_value=4)
+    num_layers = hp.Int("num_layers", min_value=2, max_value=10)
     for i in range(num_layers):
         units = hp.Int(f"units_{i}", min_value=32, max_value=256, step=32)
         x = keras.layers.Dense(units, activation="relu")(x)
@@ -461,6 +482,8 @@ def tune_hyperparameters(
     max_trials: int = 20,
     epochs_per_trial: int = 10,
     batch_size: int = 32,
+    distributed: bool = False,
+    executions_per_trial: int = 2,
 ) -> kt.Tuner:
     """Tune hyperparameters using Keras Tuner."""
 
@@ -475,14 +498,27 @@ def tune_hyperparameters(
     print(f"  Routes: {vocab_info['num_routes']}")
     print(f"  Tracks: {vocab_info['num_tracks']}")
 
-    # Create tuner
-    tuner = kt.RandomSearch(
-        hypermodel=lambda hp: build_tunable_model(hp, vocab_info),
-        objective="val_accuracy",
-        max_trials=max_trials,
-        project_name=project_name,
-        overwrite=True,
-    )
+    if distributed:
+        strategy = tf.distribute.MultiWorkerMirroredStrategy()
+        with strategy.scope():
+            tuner = kt.RandomSearch(
+                hypermodel=lambda hp: build_tunable_model(hp, vocab_info),
+                objective="val_accuracy",
+                executions_per_trial=executions_per_trial,
+                max_trials=max_trials,
+                project_name=project_name,
+                overwrite=True,
+                distribution_strategy=strategy,
+            )
+    else:
+        tuner = kt.RandomSearch(
+            hypermodel=lambda hp: build_tunable_model(hp, vocab_info),
+            objective="val_accuracy",
+            executions_per_trial=executions_per_trial,
+            max_trials=max_trials,
+            project_name=project_name,
+            overwrite=True,
+        )
 
     print(f"Starting hyperparameter tuning with {max_trials} trials...")
     print("Search space:")
@@ -492,6 +528,15 @@ def tune_hyperparameters(
     callbacks = [
         keras.callbacks.EarlyStopping(
             monitor="val_loss", patience=5, restore_best_weights=True, verbose=0
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5, patience=5, min_lr=1e-7, verbose=0
+        ),
+        keras.callbacks.ModelCheckpoint(
+            filepath=f"{project_name}_best.keras",
+            monitor="val_accuracy",
+            save_best_only=True,
+            verbose=0,
         ),
     ]
 
@@ -541,35 +586,32 @@ def train_best_model(
 
     print(model.summary())
 
-    # Setup callbacks
-    # callbacks = [
-    #     keras.callbacks.EarlyStopping(
-    #         monitor="val_loss", patience=10, restore_best_weights=True, verbose=1
-    #     ),
-    #     keras.callbacks.ReduceLROnPlateau(
-    #         monitor="val_loss", factor=0.5, patience=5, min_lr=1e-7, verbose=1
-    #     ),
-    #     keras.callbacks.ModelCheckpoint(
-    #         filepath=f"{model_save_path}_best.keras",
-    #         monitor="val_accuracy",
-    #         save_best_only=True,
-    #         verbose=1,
-    #     ),
-    # ]
+    callbacks = [
+        keras.callbacks.EarlyStopping(
+            monitor="val_loss", patience=3, restore_best_weights=True, verbose=1
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5, patience=5, min_lr=1e-7, verbose=1
+        ),
+        keras.callbacks.ModelCheckpoint(
+            filepath=f"{model_save_path}_best.keras",
+            monitor="val_accuracy",
+            save_best_only=True,
+            verbose=1,
+        ),
+    ]
 
-    # Train model
     print(f"Training model for {epochs} epochs...")
-    # history = model.fit(
-    #     train_ds,
-    #     validation_data=val_ds,
-    #     epochs=epochs,
-    #     steps_per_epoch=vocab_info["train_steps_per_epoch"],
-    #     validation_steps=vocab_info["val_steps_per_epoch"],
-    #     callbacks=callbacks,
-    #     verbose=1,
-    # )
+    model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=epochs,
+        steps_per_epoch=vocab_info["train_steps_per_epoch"],
+        validation_steps=vocab_info["val_steps_per_epoch"],
+        callbacks=callbacks,
+        verbose=1,
+    )
 
-    # Save final model
     model.save(f"{model_save_path}_final.keras")
     print(f"Model saved to {model_save_path}_final.keras")
 
@@ -744,6 +786,15 @@ if __name__ == "__main__":
         default="track_prediction_model_tuned",
         help="Model save path prefix",
     )
+    tune_parser.add_argument(
+        "--distributed", action="store_true", help="Use distributed training"
+    )
+    tune_parser.add_argument(
+        "--executions-per-trial",
+        type=int,
+        default=2,
+        help="Number of executions per trial",
+    )
 
     # Set default command to train for backward compatibility
     args = parser.parse_args()
@@ -772,6 +823,8 @@ if __name__ == "__main__":
                 max_trials=args.max_trials,
                 epochs_per_trial=args.epochs_per_trial,
                 batch_size=args.batch_size,
+                distributed=args.distributed,
+                executions_per_trial=args.executions_per_trial,
             )
 
             # Then train the best model

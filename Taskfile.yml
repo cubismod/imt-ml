@@ -16,7 +16,7 @@ tasks:
       cmds:
         - wget -O src/imt_ml/shared_types.py https://raw.githubusercontent.com/cubismod/inky-mbta-tracker/refs/heads/main/inky-mbta-tracker/shared_types/shared_types.py
   typecheck:
-    - uv run mypy src tests devtools
+    - uv run mypy src tests
   export-track-data:
     - uv run export-track-data --output ./track_data_export
   train-model:
