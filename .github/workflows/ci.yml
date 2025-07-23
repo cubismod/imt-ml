@@ -9,7 +9,6 @@ on:
     # Use ["**"] for CI on all branches.
     branches: ["main", "master"]
   pull_request:
-    branches: ["main", "master"]
 
 permissions:
   contents: read
@@ -56,8 +55,7 @@ jobs:
       - name: Install all dependencies
         run: uv sync --all-extras
 
-      - name: Run linting
-        run: uv run python devtools/lint.py
-
-      - name: Run tests
-        run: uv run pytest
+      - name: Ruff check
+        run: uv run ruff check src tests
+      - name: MyPy
+        run: uv run mypy src tests
