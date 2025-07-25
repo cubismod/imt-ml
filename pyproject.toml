@@ -43,6 +43,8 @@ dependencies = [
     "tensorflow-metal>=1.2.0",
     "keras-tuner>=1.4.7",
     "tqdm>=4.67.1",
+    "scikit-learn>=1.7.1",
+    "click>=8.2.1",
 ]
 
 

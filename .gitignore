@@ -183,6 +183,7 @@ cython_debug/
 .pypirc
 
 track_data_export/
+output/
 
 *.keras
 track_prediction_tuning/
