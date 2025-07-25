@@ -375,13 +375,15 @@ def _create_tunable_embedding_layers(
 
 def _create_tunable_dense_layers(x: tf.Tensor, hp: kt.HyperParameters) -> tf.Tensor:
     """Create tunable dense layers with hyperparameter optimization."""
-    num_layers = hp.Int("num_layers", min_value=5, max_value=40)
+    num_layers = hp.Int("num_layers", min_value=2, max_value=15)
 
     for i in range(num_layers):
-        units = hp.Int(f"units_{i}", min_value=32, max_value=256, step=32)
+        units = hp.Int(f"units_{i}", min_value=8, max_value=256, step=4)
         x = keras.layers.Dense(units, activation="relu")(x)
 
-        dropout_rate = hp.Float(f"dropout_{i}", min_value=0.1, max_value=0.5, step=0.1)
+        dropout_rate = hp.Float(
+            f"dropout_{i}", min_value=0.01, max_value=0.6, step=0.01
+        )
         x = keras.layers.Dropout(dropout_rate)(x)
 
     return x
@@ -487,7 +489,7 @@ def tune_hyperparameters(
     # Setup callbacks for tuning
     callbacks = [
         keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=5, restore_best_weights=True, verbose=0
+            monitor="val_loss", patience=2, restore_best_weights=True, verbose=0
         ),
         keras.callbacks.ReduceLROnPlateau(
             monitor="val_loss", factor=0.5, patience=5, min_lr=1e-7, verbose=0
@@ -548,7 +550,7 @@ def train_best_model(
 
     callbacks = [
         keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=3, restore_best_weights=True, verbose=1
+            monitor="val_loss", patience=2, restore_best_weights=True, verbose=1
         ),
         keras.callbacks.ReduceLROnPlateau(
             monitor="val_loss", factor=0.5, patience=5, min_lr=1e-7, verbose=1
@@ -642,7 +644,7 @@ def train_model(
     # Setup callbacks
     callbacks = [
         keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=10, restore_best_weights=True, verbose=1
+            monitor="val_loss", patience=2, restore_best_weights=True, verbose=1
         ),
         keras.callbacks.ReduceLROnPlateau(
             monitor="val_loss", factor=0.5, patience=5, min_lr=1e-7, verbose=1
