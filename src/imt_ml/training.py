@@ -13,9 +13,11 @@ import keras
 import keras_tuner as kt
 import numpy as np
 import tensorflow as tf
+from tqdm import tqdm
+from tqdm.keras import TqdmCallback
 
-from .dataset import load_tfrecord_dataset
-from .models import (
+from imt_ml.dataset import load_tfrecord_dataset
+from imt_ml.models import (
     _create_embedding_layers,
     _create_input_layers,
     _create_time_features,
@@ -160,9 +162,7 @@ def train_best_model(
             save_best_only=True,
             verbose=1,
         ),
-        keras.callbacks.TqdmCallback(
-            verbose=1, epochs_desc="Training Progress", steps_desc="Step"
-        ),
+        TqdmCallback(verbose=1, epochs_desc="Training Progress", steps_desc="Step"),
     ]
 
     print(f"Training model for {epochs} epochs...")
@@ -248,12 +248,19 @@ def train_best_model(
 
 
 def _create_optimized_callbacks(
-    model_save_path: str, dataset_size: int, monitor_patience: int | None = None
+    model_save_path: str,
+    dataset_size: int,
+    monitor_patience: int | None = None,
+    epochs: int = 50,
 ) -> list[keras.callbacks.Callback]:
     """Create optimized callbacks for small datasets."""
     # Adjust patience based on dataset size
     if monitor_patience is None:
-        monitor_patience = 5 if dataset_size < 5000 else 3
+        monitor_patience = (
+            1 + round(epochs * 0.04)
+            if dataset_size < 5000
+            else 1 + round(epochs * 0.05)
+        )
 
     # Ensure we have valid patience value before proceeding
     actual_patience = monitor_patience
@@ -269,7 +276,7 @@ def _create_optimized_callbacks(
         keras.callbacks.ReduceLROnPlateau(
             monitor="val_loss",
             factor=0.5,
-            patience=max(2, actual_patience // 2),
+            patience=round((2 + actual_patience) / 2),
             min_lr=1e-7,
             verbose=1,
             min_delta=1e-4,
@@ -340,11 +347,11 @@ def train_model(
 
     # Setup optimized callbacks
     dataset_size = vocab_info["metadata"]["total_records"]
-    callbacks = _create_optimized_callbacks(model_save_path, dataset_size)
+    callbacks = _create_optimized_callbacks(
+        model_save_path, dataset_size, epochs=epochs
+    )
     callbacks.append(
-        keras.callbacks.TqdmCallback(
-            verbose=1, epochs_desc="Training Progress", steps_desc="Step"
-        )
+        TqdmCallback(verbose=1, epochs_desc="Training Progress", steps_desc="Step")
     )
 
     # Train model with class weights for imbalanced data
@@ -550,8 +557,10 @@ def train_ensemble_model(
     dataset_size = vocab_info["metadata"]["total_records"]
     individual_metrics = []
 
-    for i, model in enumerate(models):
-        print(f"\nTraining model {i + 1}/{num_models}...")
+    for i, model in enumerate(
+        tqdm(models, desc="Training ensemble models", unit="model")
+    ):
+        tqdm.write(f"\nTraining model {i + 1}/{num_models}...")
 
         # Compile model
         adaptive_lr = learning_rate * (
@@ -566,7 +575,7 @@ def train_ensemble_model(
 
         # Setup callbacks
         callbacks = _create_optimized_callbacks(
-            f"{model_save_path}_model_{i}", dataset_size
+            f"{model_save_path}_model_{i}", dataset_size, epochs=epochs
         )
 
         # Train model
@@ -600,12 +609,15 @@ def train_ensemble_model(
         # Save individual model
         model.save(f"{model_save_path}_model_{i}_final.keras")
         trained_models.append(model)
+        tqdm.write(f"Model {i + 1} completed - Accuracy: {val_accuracy:.4f}")
 
     # Evaluate ensemble
     print("\nEvaluating ensemble performance...")
     ensemble_predictions = []
 
-    for model in trained_models:
+    for model in tqdm(
+        trained_models, desc="Evaluating ensemble models", unit="model", leave=False
+    ):
         predictions = model.predict(val_ds, verbose=0)
         ensemble_predictions.append(predictions)
 
@@ -686,7 +698,9 @@ def evaluate_with_cross_validation(
     print("Collecting data for cross-validation...")
     combined_ds = train_ds.concatenate(val_ds)
 
-    for features, target in combined_ds.take(-1):
+    for features, target in tqdm(
+        combined_ds.take(-1), desc="Collecting CV data", unit="batch", leave=False
+    ):
         all_features.append(features)
         all_targets.append(target)
 
@@ -696,8 +710,8 @@ def evaluate_with_cross_validation(
     cv_scores = []
     fold_details = []
 
-    for fold in range(k_folds):
-        print(f"\nFold {fold + 1}/{k_folds}")
+    for fold in tqdm(range(k_folds), desc="Cross-validation folds", unit="fold"):
+        tqdm.write(f"\nFold {fold + 1}/{k_folds}")
 
         # Create train/val splits for this fold
         # val_start = fold * fold_size
@@ -751,7 +765,7 @@ def evaluate_with_cross_validation(
         )
 
         cv_scores.append(best_val_acc)
-        print(f"Fold {fold + 1} accuracy: {best_val_acc:.4f}")
+        tqdm.write(f"Fold {fold + 1} accuracy: {best_val_acc:.4f}")
 
     cv_results = {
         "mean_accuracy": np.mean(cv_scores),

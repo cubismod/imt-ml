@@ -17,6 +17,7 @@ from pathlib import Path
 import redis.asyncio as redis
 import tensorflow as tf
 from pydantic import ValidationError
+from tqdm import tqdm
 
 from imt_ml.shared_types.shared_types import TrackAssignment
 
@@ -78,11 +79,10 @@ class TrackDataExporter:
 
         all_assignments: list[TrackAssignment] = []
 
-        for i, key in enumerate(timeseries_keys):
-            print(f"Processing key {i + 1}/{len(timeseries_keys)}: {key}")
+        for key in tqdm(timeseries_keys, desc="Processing timeseries keys", unit="key"):
             assignments = await self.get_historical_assignments_for_key(key)
             all_assignments.extend(assignments)
-            print(f"  Found {len(assignments)} assignments")
+            tqdm.write(f"Found {len(assignments)} assignments for {key}")
 
         print(f"Total assignments collected: {len(all_assignments)}")
         return all_assignments
@@ -187,21 +187,33 @@ class TrackDataExporter:
 
         # Write TFRecord files
         file_count = 0
-        for i in range(0, len(assignments), records_per_file):
+        total_files = (len(assignments) + records_per_file - 1) // records_per_file
+
+        for i in tqdm(
+            range(0, len(assignments), records_per_file),
+            desc="Writing TFRecord files",
+            unit="file",
+            total=total_files,
+        ):
             file_count += 1
             batch = assignments[i : i + records_per_file]
             filename = output_dir / f"track_data_{file_count:04d}.tfrecord"
 
-            print(f"Writing {len(batch)} records to {filename}")
+            tqdm.write(f"Writing {len(batch)} records to {filename}")
 
             writer = tf.io.TFRecordWriter(str(filename))
             try:
-                for assignment in batch:
+                for assignment in tqdm(
+                    batch,
+                    desc=f"Creating examples for file {file_count}",
+                    unit="record",
+                    leave=False,
+                ):
                     try:
                         example = self.create_tf_example(assignment)
                         writer.write(example.SerializeToString())
                     except Exception as e:
-                        print(f"Warning: Failed to serialize assignment: {e}")
+                        tqdm.write(f"Warning: Failed to serialize assignment: {e}")
                         continue
             finally:
                 writer.close()

@@ -17,20 +17,20 @@ import time
 import click
 
 # Import main functions to maintain backward compatibility
-from .dataset import (
+from imt_ml.dataset import (
     create_feature_engineering_fn,
     load_tfrecord_dataset,
     parse_tfrecord_fn,
 )
-from .models import (
+from imt_ml.models import (
     build_tunable_model,
     create_simple_model,
 )
-from .reporting import (
-    _create_timestamped_output_dir,
-    _generate_training_report,
+from imt_ml.reporting import (
+    create_timestamped_output_dir,
+    generate_training_report,
 )
-from .training import (
+from imt_ml.training import (
     evaluate_with_cross_validation,
     train_best_model,
     train_ensemble_model,
@@ -70,14 +70,14 @@ def cli(ctx, data_dir):
 def train(ctx, epochs, batch_size, learning_rate, model_path):
     """Train model with fixed hyperparameters."""
     try:
-        full_model_path = _create_timestamped_output_dir("train", model_path)
+        full_model_path = create_timestamped_output_dir("train", model_path)
         train_model(
             data_dir=ctx.obj["data_dir"],
             epochs=epochs,
             batch_size=batch_size,
             learning_rate=learning_rate,
             model_save_path=full_model_path,
-            generate_report_func=_generate_training_report,
+            generate_report_func=generate_training_report,
         )
     except Exception as e:
         click.echo(f"Error during training: {e}", err=True)
@@ -98,7 +98,7 @@ def train(ctx, epochs, batch_size, learning_rate, model_path):
 def ensemble(ctx, num_models, epochs, batch_size, learning_rate, model_path):
     """Train ensemble of models for better accuracy."""
     try:
-        full_model_path = _create_timestamped_output_dir("ensemble", model_path)
+        full_model_path = create_timestamped_output_dir("ensemble", model_path)
         train_ensemble_model(
             data_dir=ctx.obj["data_dir"],
             num_models=num_models,
@@ -106,7 +106,7 @@ def ensemble(ctx, num_models, epochs, batch_size, learning_rate, model_path):
             batch_size=batch_size,
             learning_rate=learning_rate,
             model_save_path=full_model_path,
-            generate_report_func=_generate_training_report,
+            generate_report_func=generate_training_report,
         )
     except Exception as e:
         click.echo(f"Error during ensemble training: {e}", err=True)
@@ -121,14 +121,14 @@ def ensemble(ctx, num_models, epochs, batch_size, learning_rate, model_path):
 def cv(ctx, k_folds, epochs, batch_size):
     """Evaluate model using cross-validation."""
     try:
-        full_model_path = _create_timestamped_output_dir("cv", "cv_evaluation")
+        full_model_path = create_timestamped_output_dir("cv", "cv_evaluation")
         evaluate_with_cross_validation(
             data_dir=ctx.obj["data_dir"],
             k_folds=k_folds,
             epochs=epochs,
             batch_size=batch_size,
             model_save_path=full_model_path,
-            generate_report_func=_generate_training_report,
+            generate_report_func=generate_training_report,
         )
     except Exception as e:
         click.echo(f"Error during cross-validation: {e}", err=True)
@@ -172,7 +172,7 @@ def tune(
 ):
     """Tune hyperparameters using Hyperband algorithm and train best model."""
     try:
-        full_model_path = _create_timestamped_output_dir("tune", model_path)
+        full_model_path = create_timestamped_output_dir("tune", model_path)
         # First tune hyperparameters
         tuning_start_time = time.time()
         tuner = tune_hyperparameters(
@@ -195,7 +195,7 @@ def tune(
             batch_size=batch_size,
             model_save_path=full_model_path,
             tuning_time=tuning_time,
-            generate_report_func=_generate_training_report,
+            generate_report_func=generate_training_report,
         )
     except Exception as e:
         click.echo(f"Error during hyperparameter tuning: {e}", err=True)
@@ -218,8 +218,8 @@ __all__ = [
     "train_best_model",
     "evaluate_with_cross_validation",
     # Utility functions
-    "_create_timestamped_output_dir",
-    "_generate_training_report",
+    "create_timestamped_output_dir",
+    "generate_training_report",
     # CLI
     "cli",
 ]

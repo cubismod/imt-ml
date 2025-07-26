@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any
 
 
-def _create_timestamped_output_dir(command_name: str, model_save_path: str) -> str:
+def create_timestamped_output_dir(command_name: str, model_save_path: str) -> str:
     """Create a timestamped output directory and return the full model path."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -31,7 +31,7 @@ def _create_timestamped_output_dir(command_name: str, model_save_path: str) -> s
     return full_path
 
 
-def _generate_training_report(
+def generate_training_report(
     command_name: str,
     model_save_path: str,
     vocab_info: dict[str, Any],
