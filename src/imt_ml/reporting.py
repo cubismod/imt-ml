@@ -79,10 +79,8 @@ def generate_training_report(
 
     # Add final metrics
     for metric, value in final_metrics.items():
-        if isinstance(value, float):
-            report_content += f"- **{metric.replace('_', ' ').title()}**: {value:.4f}\n"
-        else:
-            report_content += f"- **{metric.replace('_', ' ').title()}**: {value}\n"
+        report_content += f"- **{metric.replace('_', ' ').title()}**: {value:.4f}\n"
+       
 
     # Add additional information if provided
     if additional_info:
