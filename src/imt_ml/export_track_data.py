@@ -62,6 +62,13 @@ class TrackDataExporter:
             if assignment_data:
                 try:
                     assignment = TrackAssignment.model_validate_json(assignment_data)
+                    # remove noninteger values due to an earlier bug
+                    if (
+                        assignment.track_number
+                        and not assignment.track_number.isdigit()
+                    ):
+                        print(f"Skipping invalid track num: {assignment.track_number}")
+                        continue
                     assignments.append(assignment)
                 except ValidationError as e:
                     print(
