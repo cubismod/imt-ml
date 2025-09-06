@@ -46,6 +46,7 @@ dependencies = [
     "click>=8.2.1",
     "tensorflow[and-cuda]>=2.19.0 ; sys_platform == 'linux'",
     "tensorflow-metal>=1.2.0 ; sys_platform == 'darwin'",
+    "ray[tune]>=2.49.1",
 ]
 
 

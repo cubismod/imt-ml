@@ -79,21 +79,25 @@ uv run src/imt_ml/tfrecord_reader.py track_data_export/2024-01-15_12-30-45 train
   --model-path my_model
 ```
 
-### Hyperparameter Tuning
+### Hyperparameter Tuning (Ray Tune ASHA)
 ```bash
-# Tune hyperparameters with Hyperband algorithm, then train best model
+# Tune hyperparameters with Ray Tune's ASHA scheduler, then train best model
 uv run src/imt_ml/tfrecord_reader.py track_data_export/2024-01-15_12-30-45 tune \
   --max-epochs 50 \
   --final-epochs 100 \
+  --num-samples 40 \
   --project-name my_tuning_project
 
-# Advanced tuning options
+# Control ASHA behavior and Ray output directory
 uv run src/imt_ml/tfrecord_reader.py track_data_export/2024-01-15_12-30-45 tune \
-  --factor 3 \
-  --hyperband-iterations 2 \
-  --executions-per-trial 3 \
-  --distributed
+  --max-epochs 75 \
+  --num-samples 60 \
+  --asha-grace-period 5 \
+  --asha-reduction-factor 3 \
+  --ray-dir /mnt/shared/ray_results
 ```
+
+
 
 ## Distributed Training & Tuning
 
@@ -186,6 +190,19 @@ uv run src/imt_ml/tfrecord_reader.py track_data_export/2024-01-15_12-30-45 ensem
   --epochs 75 \
   --learning-rate 0.0005 \
   --model-path ensemble_model
+
+# Train longer and relax early stopping
+uv run src/imt_ml/tfrecord_reader.py track_data_export/<date> ensemble \
+  --epochs 150 \
+  --early-stop-patience 20 \
+  --early-stop-min-delta 1e-5 \
+  --reduce-lr-patience 10 \
+  --reduce-lr-factor 0.5 \
+  --scheduler-tmax 100
+
+# Disable early stopping or the cosine scheduler
+uv run src/imt_ml/tfrecord_reader.py track_data_export/<date> ensemble --no-early-stop
+uv run src/imt_ml/tfrecord_reader.py track_data_export/<date> ensemble --no-scheduler
 ```
 
 ### Cross-Validation
@@ -199,7 +216,7 @@ uv run src/imt_ml/tfrecord_reader.py track_data_export/2024-01-15_12-30-45 cv \
 ### Training Modes Explained
 
 - **train**: Standard training with fixed hyperparameters, includes regularization and data augmentation for small datasets
-- **tune**: Uses Keras Tuner's Hyperband algorithm to find optimal hyperparameters, then trains the best model
+- **tune**: Uses Ray Tune's ASHA scheduler to find optimal hyperparameters, then trains the best model
 - **ensemble**: Trains multiple models with different architectures for improved accuracy through ensemble voting
 - **cv**: Evaluates model performance using k-fold cross-validation for robust accuracy estimation
 

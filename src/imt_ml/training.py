@@ -7,7 +7,7 @@ standard training, ensemble training, hyperparameter tuning, and cross-validatio
 
 import json
 import time
-from typing import Any, List
+from typing import Any, List, cast
 
 import keras
 import keras_tuner as kt
@@ -22,6 +22,7 @@ from imt_ml.models import (
     _create_embedding_layers,
     _create_input_layers,
     _create_time_features,
+    build_model_from_config,
     build_tunable_model,
     create_simple_model,
 )
@@ -164,6 +165,256 @@ def tune_hyperparameters(
     return tuner
 
 
+def tune_hyperparameters_ray(
+    data_dir: str,
+    project_name: str = "track_prediction_tuning",
+    max_epochs: int = 50,
+    batch_size: int = 32,
+    num_samples: int = 20,
+    asha_grace_period: int = 5,
+    asha_reduction_factor: int = 3,
+    directory: str | None = None,
+    gpus_per_trial: float = 0.0,
+    cpus_per_trial: float | None = None,
+) -> dict[str, Any]:
+    """Tune hyperparameters using Ray Tune with ASHA early stopping.
+
+    Returns the best config dict found by Ray.
+    """
+    # Import Ray lazily to avoid hard dependency at import time
+    try:
+        import os as _os
+
+        import ray  # type: ignore
+        from ray import tune  # type: ignore
+        from ray.tune.schedulers import ASHAScheduler  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError(
+            "Ray Tune is required for tune_hyperparameters_ray. Install ray[tune]."
+        ) from e
+
+    # Ensure Ray uses the active virtualenv and doesn't try to recreate envs with uv
+    _os.environ.setdefault("UV_ACTIVE", "1")
+    if not ray.is_initialized():  # type: ignore[attr-defined]
+        ray.init(runtime_env={"env_vars": {"UV_ACTIVE": "1"}})  # type: ignore[call-arg]
+
+    def trainable(config: dict[str, Any]):
+        # Load dataset per trial to avoid cross-trial state
+        train_ds, val_ds, vocab_info = load_tfrecord_dataset(
+            data_dir, batch_size=batch_size
+        )
+        # Build and train model for this config
+        model = build_model_from_config(config, vocab_info)
+
+        # Report metrics to Ray each epoch
+        class _TuneReportCallback(keras.callbacks.Callback):  # type: ignore[misc]
+            def on_epoch_end(self, epoch: int, logs: dict[str, float] | None = None):
+                logs = logs or {}
+                metrics = {
+                    "val_accuracy": float(logs.get("val_accuracy", 0.0)),
+                    "val_loss": float(logs.get("val_loss", 0.0)),
+                    "accuracy": float(logs.get("accuracy", 0.0)),
+                    "loss": float(logs.get("loss", 0.0)),
+                    "epoch": epoch,
+                }
+                # Report metrics via Tune as a dict (compatible across Ray versions)
+                tune.report(metrics=metrics)
+
+        callbacks = [
+            keras.callbacks.EarlyStopping(
+                monitor="val_loss", patience=3, restore_best_weights=True
+            ),
+            _TuneReportCallback(),
+        ]
+
+        model.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=max_epochs,
+            steps_per_epoch=vocab_info["train_steps_per_epoch"],
+            validation_steps=vocab_info["val_steps_per_epoch"],
+            callbacks=callbacks,
+            verbose=0,
+        )
+
+    # Define search space similar to Keras Tuner configuration
+    max_layers = 10
+    config_space: dict[str, Any] = {
+        "station_embedding_dim": tune.choice([8, 16, 24, 32, 40, 48, 56, 64]),
+        "route_embedding_dim": tune.choice([4, 8, 12, 16, 24, 32, 40, 48, 56, 64]),
+        "direction_embedding_dim": tune.choice([2, 4, 6, 8, 12, 16, 24, 32]),
+        "num_layers": tune.randint(2, max_layers + 1),
+        "learning_rate": tune.loguniform(1e-4, 1e-2),
+    }
+    for i in range(max_layers):
+        config_space[f"units_{i}"] = tune.randint(8, 257)
+        config_space[f"dropout_{i}"] = tune.uniform(0.01, 0.6)
+
+    scheduler = ASHAScheduler(
+        time_attr="training_iteration",
+        metric="val_accuracy",
+        mode="max",
+        grace_period=asha_grace_period,
+        reduction_factor=asha_reduction_factor,
+        max_t=max_epochs,
+    )
+
+    trainable_with_resources = tune.with_resources(
+        trainable, resources={"cpu": (cpus_per_trial or 1), "gpu": gpus_per_trial}
+    )
+
+    analysis = tune.run(
+        trainable_with_resources,
+        name=project_name,
+        scheduler=scheduler,
+        num_samples=num_samples,
+        local_dir=directory,  # may be None, Ray defaults to ~/ray_results
+        config=config_space,
+        verbose=1,
+    )
+
+    # Explicitly provide metric/mode when fetching best config to avoid Tune API warnings
+    best_config = cast(
+        dict[str, Any], analysis.get_best_config(metric="val_accuracy", mode="max")
+    )
+    # Persist best config as JSON next to Ray results for convenience
+    try:
+        import json
+        import os
+
+        out_dir = analysis.get_best_logdir("val_accuracy", mode="max")
+        if out_dir:
+            with open(os.path.join(out_dir, "best_config.json"), "w") as f:
+                json.dump(best_config, f, indent=2)
+    except Exception:
+        pass
+
+    return best_config
+
+
+def train_best_model_from_config(
+    best_config: dict[str, Any],
+    data_dir: str,
+    epochs: int = 50,
+    batch_size: int = 32,
+    model_save_path: str = "track_prediction_model_tuned",
+    tuning_time: float = 0.0,
+    generate_report_func=None,
+) -> keras.Model:
+    """Train a model using a Ray Tune best config and save artifacts."""
+    start_time = time.time()
+
+    # Load dataset
+    train_ds, val_ds, vocab_info = load_tfrecord_dataset(
+        data_dir, batch_size=batch_size
+    )
+
+    # Build model from best config
+    model = build_model_from_config(best_config, vocab_info)
+
+    # Log and train
+    print("Training best model with Ray-derived hyperparameters:")
+    for k, v in best_config.items():
+        print(f"  {k}: {v}")
+
+    callbacks = [
+        keras.callbacks.EarlyStopping(
+            monitor="val_loss", patience=2, restore_best_weights=True, verbose=1
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5, patience=5, min_lr=1e-7, verbose=1
+        ),
+        _ModelCheckpointNoOptimizer(
+            filepath=f"{model_save_path}_best.keras",
+            monitor="val_accuracy",
+            save_best_only=True,
+            verbose=1,
+        ),
+        TqdmCallback(verbose=1, epochs_desc="Training Progress", steps_desc="Step"),
+    ]
+
+    history = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=epochs,
+        steps_per_epoch=vocab_info["train_steps_per_epoch"],
+        validation_steps=vocab_info["val_steps_per_epoch"],
+        callbacks=callbacks,
+        verbose=1,
+    )
+
+    model.save(f"{model_save_path}_final.keras", include_optimizer=False)
+    print(f"Model saved to {model_save_path}_final.keras (no optimizer state)")
+
+    # Save hyperparameters and vocabulary info
+    save_path = f"{model_save_path}_config.json"
+    config = {
+        "hyperparameters": best_config,
+        "vocabulary": {
+            "station_vocab": vocab_info["station_vocab"],
+            "route_vocab": vocab_info["route_vocab"],
+            "track_vocab": vocab_info["track_vocab"],
+            "num_stations": vocab_info["num_stations"],
+            "num_routes": vocab_info["num_routes"],
+            "num_tracks": vocab_info["num_tracks"],
+        },
+    }
+    with open(save_path, "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"Configuration saved to {save_path}")
+
+    # Evaluate model
+    print("\nFinal evaluation:")
+    val_loss, val_accuracy = model.evaluate(
+        val_ds, steps=vocab_info["val_steps_per_epoch"], verbose=1
+    )
+    print(f"Validation Loss: {val_loss:.4f}")
+    print(f"Validation Accuracy: {val_accuracy:.4f}")
+
+    # Calculate total time
+    final_training_time = time.time() - start_time
+    total_time = tuning_time + final_training_time
+
+    # Generate tuning report if function provided
+    if generate_report_func:
+        training_params = {
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "dataset_size": vocab_info["metadata"]["total_records"],
+            "tuning_algorithm": "Ray Tune ASHA",
+        }
+
+        final_metrics = {
+            "validation_loss": val_loss,
+            "validation_accuracy": val_accuracy,
+            "total_epochs_trained": len(history.history["loss"]),
+            "best_validation_accuracy": max(history.history.get("val_accuracy", [0.0])),
+            "best_validation_loss": min(
+                history.history.get("val_loss", [float("inf")])
+            ),
+        }
+
+        additional_info = {
+            "final_training_time": final_training_time,
+            "total_time": total_time,
+            "model_parameters": model.count_params(),
+            "optimization_objective": "val_accuracy",
+            "best_hyperparameters": best_config,
+        }
+
+        generate_report_func(
+            "tune",
+            model_save_path,
+            vocab_info,
+            training_params,
+            final_metrics,
+            total_time,
+            additional_info,
+        )
+
+    return model
+
+
 def train_best_model(
     tuner: kt.Tuner,
     data_dir: str,
@@ -300,6 +551,14 @@ def _create_optimized_callbacks(
     dataset_size: int,
     monitor_patience: int | None = None,
     epochs: int = 50,
+    *,
+    min_delta: float = 1e-4,
+    reduce_lr_patience: int | None = None,
+    reduce_lr_factor: float = 0.5,
+    min_lr: float = 1e-7,
+    use_scheduler: bool = True,
+    scheduler_tmax: int = 50,
+    use_early_stopping: bool = True,
 ) -> list[keras.callbacks.Callback]:
     """Create optimized callbacks for small datasets."""
     # Adjust patience based on dataset size
@@ -313,33 +572,54 @@ def _create_optimized_callbacks(
     # Ensure we have valid patience value before proceeding
     actual_patience = monitor_patience
 
-    callbacks = [
-        keras.callbacks.EarlyStopping(
-            monitor="val_loss",
-            patience=actual_patience,
-            restore_best_weights=True,
-            verbose=1,
-            min_delta=1e-4,  # Smaller threshold for small datasets
-        ),
+    callbacks: list[keras.callbacks.Callback] = []
+
+    if use_early_stopping:
+        callbacks.append(
+            keras.callbacks.EarlyStopping(
+                monitor="val_loss",
+                patience=actual_patience,
+                restore_best_weights=True,
+                verbose=1,
+                min_delta=min_delta,
+            )
+        )
+
+    # Set default patience for ReduceLROnPlateau if not provided
+    rlrop_patience = (
+        round((2 + actual_patience) / 2)
+        if reduce_lr_patience is None
+        else reduce_lr_patience
+    )
+    callbacks.append(
         keras.callbacks.ReduceLROnPlateau(
             monitor="val_loss",
-            factor=0.5,
-            patience=round((2 + actual_patience) / 2),
-            min_lr=1e-7,
+            factor=reduce_lr_factor,
+            patience=rlrop_patience,
+            min_lr=min_lr,
             verbose=1,
-            min_delta=1e-4,
-        ),
+            min_delta=min_delta,
+        )
+    )
+
+    callbacks.append(
         _ModelCheckpointNoOptimizer(
             filepath=f"{model_save_path}_best.keras",
             monitor="val_accuracy",
             save_best_only=True,
             verbose=1,
-        ),
-        # Cosine annealing for better convergence
-        keras.callbacks.LearningRateScheduler(
-            lambda epoch: 0.001 * (0.5 * (1 + np.cos(np.pi * epoch / 50))), verbose=1
-        ),
-    ]
+        )
+    )
+
+    if use_scheduler:
+        # Cosine annealing scheduler with configurable period; scales from current lr
+        callbacks.append(
+            keras.callbacks.LearningRateScheduler(
+                lambda epoch, lr: lr
+                * (0.5 * (1 + np.cos(np.pi * epoch / scheduler_tmax))),
+                verbose=1,
+            )
+        )
 
     return callbacks
 
@@ -584,6 +864,15 @@ def train_ensemble_model(
     learning_rate: float = 0.001,
     model_save_path: str = "track_prediction_ensemble",
     generate_report_func=None,
+    *,
+    early_stop_patience: int | None = None,
+    early_stop_min_delta: float = 1e-4,
+    reduce_lr_patience: int | None = None,
+    reduce_lr_factor: float = 0.5,
+    min_lr: float = 1e-7,
+    use_scheduler: bool = True,
+    scheduler_tmax: int = 50,
+    use_early_stopping: bool = True,
 ) -> list[keras.Model]:
     """Train ensemble of models for improved accuracy on small datasets."""
     start_time = time.time()
@@ -625,7 +914,17 @@ def train_ensemble_model(
 
         # Setup callbacks
         callbacks = _create_optimized_callbacks(
-            f"{model_save_path}_model_{i}", dataset_size, epochs=epochs
+            f"{model_save_path}_model_{i}",
+            dataset_size,
+            monitor_patience=early_stop_patience,
+            epochs=epochs,
+            min_delta=early_stop_min_delta,
+            reduce_lr_patience=reduce_lr_patience,
+            reduce_lr_factor=reduce_lr_factor,
+            min_lr=min_lr,
+            use_scheduler=use_scheduler,
+            scheduler_tmax=scheduler_tmax,
+            use_early_stopping=use_early_stopping,
         )
 
         # Train model
@@ -645,7 +944,10 @@ def train_ensemble_model(
         model.fit(**fit_kwargs)
 
         # Evaluate individual model
-        val_loss, val_accuracy = model.evaluate(val_ds, verbose=1)
+        # val_ds repeats indefinitely; bound evaluation by known validation steps
+        val_loss, val_accuracy = model.evaluate(
+            val_ds, steps=vocab_info["val_steps_per_epoch"], verbose=1
+        )
         individual_metrics.append(
             {
                 "model_index": i,

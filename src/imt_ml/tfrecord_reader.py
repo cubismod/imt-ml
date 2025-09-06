@@ -32,10 +32,10 @@ from imt_ml.reporting import (
 )
 from imt_ml.training import (
     evaluate_with_cross_validation,
-    train_best_model,
+    train_best_model_from_config,
     train_ensemble_model,
     train_model,
-    tune_hyperparameters,
+    tune_hyperparameters_ray,
 )
 
 
@@ -90,12 +90,59 @@ def train(ctx, epochs, batch_size, learning_rate, model_path):
 @click.option("--batch-size", default=32, help="Batch size")
 @click.option("--learning-rate", default=0.001, help="Learning rate")
 @click.option(
+    "--early-stop-patience",
+    type=int,
+    default=None,
+    help="Early stopping patience (disable by setting 0 or use --no-early-stop)",
+)
+@click.option(
+    "--early-stop-min-delta",
+    type=float,
+    default=1e-4,
+    help="Minimum delta for early stopping and LR plateau",
+)
+@click.option(
+    "--reduce-lr-patience",
+    type=int,
+    default=None,
+    help="Patience for ReduceLROnPlateau (defaults relative to early stop)",
+)
+@click.option(
+    "--reduce-lr-factor", type=float, default=0.5, help="Factor for ReduceLROnPlateau"
+)
+@click.option(
+    "--min-lr",
+    type=float,
+    default=1e-7,
+    help="Minimum learning rate for ReduceLROnPlateau",
+)
+@click.option(
+    "--scheduler-tmax", type=int, default=50, help="Cosine LR scheduler period (epochs)"
+)
+@click.option("--no-scheduler", is_flag=True, help="Disable cosine LR scheduler")
+@click.option("--no-early-stop", is_flag=True, help="Disable early stopping")
+@click.option(
     "--model-path",
     default="track_prediction_ensemble",
     help="Model save path prefix",
 )
 @click.pass_context
-def ensemble(ctx, num_models, epochs, batch_size, learning_rate, model_path):
+def ensemble(
+    ctx,
+    num_models,
+    epochs,
+    batch_size,
+    learning_rate,
+    early_stop_patience,
+    early_stop_min_delta,
+    reduce_lr_patience,
+    reduce_lr_factor,
+    min_lr,
+    scheduler_tmax,
+    no_scheduler,
+    no_early_stop,
+    model_path,
+):
     """Train ensemble of models for better accuracy."""
     try:
         full_model_path = create_timestamped_output_dir("ensemble", model_path)
@@ -107,6 +154,14 @@ def ensemble(ctx, num_models, epochs, batch_size, learning_rate, model_path):
             learning_rate=learning_rate,
             model_save_path=full_model_path,
             generate_report_func=generate_training_report,
+            early_stop_patience=early_stop_patience,
+            early_stop_min_delta=early_stop_min_delta,
+            reduce_lr_patience=reduce_lr_patience,
+            reduce_lr_factor=reduce_lr_factor,
+            min_lr=min_lr,
+            use_scheduler=not no_scheduler,
+            scheduler_tmax=scheduler_tmax,
+            use_early_stopping=not no_early_stop,
         )
     except Exception as e:
         click.echo(f"Error during ensemble training: {e}", err=True)
@@ -136,60 +191,67 @@ def cv(ctx, k_folds, epochs, batch_size):
 
 
 @cli.command()
-@click.option("--max-epochs", default=50, help="Maximum epochs for Hyperband algorithm")
-@click.option("--factor", default=3, help="Hyperband reduction factor")
+@click.option("--max-epochs", default=50, help="Max epochs per trial")
 @click.option(
-    "--hyperband-iterations", default=1, help="Number of Hyperband iterations"
+    "--final-epochs", default=50, help="Epochs for final training of best config"
 )
-@click.option("--final-epochs", default=50, help="Epochs for final training")
 @click.option("--batch-size", default=32, help="Batch size")
 @click.option(
-    "--project-name",
-    default="track_prediction_tuning",
-    help="Keras Tuner project name",
+    "--project-name", default="track_prediction_tuning", help="Tuning project name"
 )
 @click.option(
     "--model-path",
     default="track_prediction_model_tuned",
     help="Model save path prefix",
 )
-@click.option("--distributed", is_flag=True, help="Use distributed training")
+@click.option("--num-samples", default=20, help="Number of Ray trials")
+@click.option("--asha-grace-period", default=5, help="ASHA grace period (epochs)")
+@click.option("--asha-reduction-factor", default=3, help="ASHA reduction factor")
 @click.option(
-    "--executions-per-trial", default=2, help="Number of executions per trial"
+    "--ray-dir", default=None, help="Ray local dir for results (default: ~/ray_results)"
+)
+@click.option(
+    "--gpus-per-trial", default=0.0, type=float, help="GPUs per Ray trial (e.g., 1)"
+)
+@click.option(
+    "--cpus-per-trial", default=None, type=float, help="CPUs per Ray trial (default 1)"
 )
 @click.pass_context
 def tune(
     ctx,
     max_epochs,
-    factor,
-    hyperband_iterations,
     final_epochs,
     batch_size,
     project_name,
     model_path,
-    distributed,
-    executions_per_trial,
+    num_samples,
+    asha_grace_period,
+    asha_reduction_factor,
+    ray_dir,
+    gpus_per_trial,
+    cpus_per_trial,
 ):
-    """Tune hyperparameters using Hyperband algorithm and train best model."""
+    """Tune hyperparameters with Ray Tune (ASHA) and train best model."""
     try:
         full_model_path = create_timestamped_output_dir("tune", model_path)
-        # First tune hyperparameters
         tuning_start_time = time.time()
-        tuner = tune_hyperparameters(
+
+        best_config = tune_hyperparameters_ray(
             data_dir=ctx.obj["data_dir"],
             project_name=project_name,
             max_epochs=max_epochs,
-            factor=factor,
-            hyperband_iterations=hyperband_iterations,
             batch_size=batch_size,
-            distributed=distributed,
-            executions_per_trial=executions_per_trial,
+            num_samples=num_samples,
+            asha_grace_period=asha_grace_period,
+            asha_reduction_factor=asha_reduction_factor,
+            directory=ray_dir,
+            gpus_per_trial=gpus_per_trial,
+            cpus_per_trial=cpus_per_trial,
         )
         tuning_time = time.time() - tuning_start_time
 
-        # Then train the best model
-        train_best_model(
-            tuner=tuner,
+        train_best_model_from_config(
+            best_config=best_config,
             data_dir=ctx.obj["data_dir"],
             epochs=final_epochs,
             batch_size=batch_size,
@@ -214,8 +276,8 @@ __all__ = [
     # Training functions
     "train_model",
     "train_ensemble_model",
-    "tune_hyperparameters",
-    "train_best_model",
+    "tune_hyperparameters_ray",
+    "train_best_model_from_config",
     "evaluate_with_cross_validation",
     # Utility functions
     "create_timestamped_output_dir",

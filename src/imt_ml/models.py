@@ -8,7 +8,6 @@ including simple models and tunable models for hyperparameter optimization.
 from typing import Any
 
 import keras
-import keras_tuner as kt
 import tensorflow as tf
 
 
@@ -142,7 +141,7 @@ def create_simple_model(
 
 
 def _create_tunable_embedding_layers(
-    inputs: dict[str, tf.Tensor], vocab_info: dict[str, Any], hp: kt.HyperParameters
+    inputs: dict[str, tf.Tensor], vocab_info: dict[str, Any], hp: Any
 ) -> dict[str, tf.Tensor]:
     """Create tunable embedding layers for categorical features."""
     # Tunable embedding dimensions
@@ -173,7 +172,7 @@ def _create_tunable_embedding_layers(
     }
 
 
-def _create_tunable_dense_layers(x: tf.Tensor, hp: kt.HyperParameters) -> tf.Tensor:
+def _create_tunable_dense_layers(x: tf.Tensor, hp: Any) -> tf.Tensor:
     """Create tunable dense layers with hyperparameter optimization."""
     num_layers = hp.Int("num_layers", min_value=2, max_value=15)
 
@@ -189,9 +188,7 @@ def _create_tunable_dense_layers(x: tf.Tensor, hp: kt.HyperParameters) -> tf.Ten
     return x
 
 
-def build_tunable_model(
-    hp: kt.HyperParameters, vocab_info: dict[str, Any]
-) -> keras.Model:
+def build_tunable_model(hp: Any, vocab_info: dict[str, Any]) -> keras.Model:
     """Create a tunable neural network for track prediction with hyperparameter optimization."""
 
     # Create input layers
@@ -228,4 +225,61 @@ def build_tunable_model(
         metrics=["accuracy"],
     )
 
+    return model
+
+
+def build_model_from_config(
+    config: dict[str, Any], vocab_info: dict[str, Any]
+) -> keras.Model:
+    """Build a model using a plain config dict (for Ray Tune).
+
+    The config is expected to contain keys similar to the Keras Tuner space:
+      - station_embedding_dim, route_embedding_dim, direction_embedding_dim
+      - num_layers, units_0..units_{n-1}, dropout_0..dropout_{n-1}
+      - learning_rate
+    """
+    # Inputs and time features
+    inputs = _create_input_layers()
+
+    # Embeddings
+    station_dim = int(config.get("station_embedding_dim", 16))
+    route_dim = int(config.get("route_embedding_dim", 8))
+    direction_dim = int(config.get("direction_embedding_dim", 4))
+
+    station_emb = keras.layers.Flatten()(
+        keras.layers.Embedding(vocab_info["num_stations"] + 1, station_dim)(
+            inputs["station_id"]
+        )
+    )
+    route_emb = keras.layers.Flatten()(
+        keras.layers.Embedding(vocab_info["num_routes"] + 1, route_dim)(
+            inputs["route_id"]
+        )
+    )
+    direction_emb = keras.layers.Flatten()(
+        keras.layers.Embedding(3, direction_dim)(inputs["direction_id"])
+    )
+
+    time_features = _create_time_features(inputs)
+    all_features = [station_emb, route_emb, direction_emb] + time_features
+    concat_features = keras.layers.Concatenate()(all_features)
+
+    # Dense stack
+    x = concat_features
+    num_layers = int(config.get("num_layers", 3))
+    for i in range(num_layers):
+        units = int(config.get(f"units_{i}", 64))
+        dropout = float(config.get(f"dropout_{i}", 0.3))
+        x = keras.layers.Dense(units, activation="relu")(x)
+        x = keras.layers.Dropout(dropout)(x)
+
+    outputs = keras.layers.Dense(vocab_info["num_tracks"], activation="softmax")(x)
+    model = keras.Model(inputs=list(inputs.values()), outputs=outputs)
+
+    lr = float(config.get("learning_rate", 1e-3))
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=lr),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
     return model
