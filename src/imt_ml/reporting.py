@@ -80,7 +80,6 @@ def generate_training_report(
     # Add final metrics
     for metric, value in final_metrics.items():
         report_content += f"- **{metric.replace('_', ' ').title()}**: {value:.4f}\n"
-       
 
     # Add additional information if provided
     if additional_info:
@@ -120,7 +119,8 @@ def generate_training_report(
 
     ```python
     import keras
-    model = keras.models.load_model('{os.path.basename(model_save_path)}_final.keras')
+    # Load for inference (optimizer not saved):
+    model = keras.models.load_model('{os.path.basename(model_save_path)}_final.keras', compile=False)
     ```
 
     ---

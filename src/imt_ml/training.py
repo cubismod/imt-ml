@@ -7,12 +7,13 @@ standard training, ensemble training, hyperparameter tuning, and cross-validatio
 
 import json
 import time
-from typing import Any
+from typing import Any, List
 
 import keras
 import keras_tuner as kt
 import numpy as np
 import tensorflow as tf
+from keras import Model
 from tqdm import tqdm
 from tqdm.keras import TqdmCallback
 
@@ -24,6 +25,47 @@ from imt_ml.models import (
     build_tunable_model,
     create_simple_model,
 )
+
+
+class _ModelCheckpointNoOptimizer(keras.callbacks.Callback):  # type: ignore[misc]
+    """Checkpoint that saves the full model without optimizer state.
+
+    Mirrors the common `ModelCheckpoint(save_best_only=True)` behavior but
+    calls `model.save(..., include_optimizer=False)` to avoid optimizer
+    variable mismatch warnings on load.
+    """
+
+    def __init__(
+        self,
+        filepath: str,
+        monitor: str = "val_accuracy",
+        mode: str = "max",
+        save_best_only: bool = True,
+        verbose: int = 1,
+    ) -> None:
+        super().__init__()
+        self.filepath = filepath
+        self.monitor = monitor
+        self.mode = mode
+        self.save_best_only = save_best_only
+        self.verbose = verbose
+        if mode not in ("max", "min"):
+            raise ValueError("mode must be 'max' or 'min'")
+        self.best = -np.inf if mode == "max" else np.inf
+
+    def on_epoch_end(self, epoch: int, logs: dict[str, float] | None = None) -> None:
+        logs = logs or {}
+        current = logs.get(self.monitor)
+        if current is None:
+            return
+        improved = current > self.best if self.mode == "max" else current < self.best
+        if self.save_best_only and not improved:
+            return
+        self.best = current
+        if self.verbose:
+            print(f"Epoch {epoch + 1}: saving model to {self.filepath} (no optimizer)")
+        # Save the full model without optimizer state
+        self.model.save(self.filepath, include_optimizer=False)
 
 
 def tune_hyperparameters(
@@ -84,16 +126,17 @@ def tune_hyperparameters(
     # Setup callbacks for tuning
     callbacks = [
         keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=2, restore_best_weights=True, verbose=0
+            monitor="val_loss", patience=2, restore_best_weights=True, verbose=1
         ),
         keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5, patience=5, min_lr=1e-7, verbose=0
+            monitor="val_loss", factor=0.5, patience=5, min_lr=1e-7, verbose=1
         ),
+        # During hyperparameter tuning, keep optimizer state in checkpoints
         keras.callbacks.ModelCheckpoint(
             filepath=f"{project_name}_best.keras",
             monitor="val_accuracy",
             save_best_only=True,
-            verbose=0,
+            verbose=1,
         ),
     ]
 
@@ -156,7 +199,7 @@ def train_best_model(
         keras.callbacks.ReduceLROnPlateau(
             monitor="val_loss", factor=0.5, patience=5, min_lr=1e-7, verbose=1
         ),
-        keras.callbacks.ModelCheckpoint(
+        _ModelCheckpointNoOptimizer(
             filepath=f"{model_save_path}_best.keras",
             monitor="val_accuracy",
             save_best_only=True,
@@ -176,8 +219,8 @@ def train_best_model(
         verbose=1,
     )
 
-    model.save(f"{model_save_path}_final.keras")
-    print(f"Model saved to {model_save_path}_final.keras")
+    model.save(f"{model_save_path}_final.keras", include_optimizer=False)
+    print(f"Model saved to {model_save_path}_final.keras (no optimizer state)")
 
     # Save hyperparameters and vocabulary info
     save_path = f"{model_save_path}_config.json"
@@ -198,7 +241,9 @@ def train_best_model(
 
     # Evaluate model
     print("\nFinal evaluation:")
-    val_loss, val_accuracy = model.evaluate(val_ds, verbose=0)
+    val_loss, val_accuracy = model.evaluate(
+        val_ds, steps=vocab_info["val_steps_per_epoch"], verbose=1
+    )
     print(f"Validation Loss: {val_loss:.4f}")
     print(f"Validation Accuracy: {val_accuracy:.4f}")
 
@@ -281,7 +326,7 @@ def _create_optimized_callbacks(
             verbose=1,
             min_delta=1e-4,
         ),
-        keras.callbacks.ModelCheckpoint(
+        _ModelCheckpointNoOptimizer(
             filepath=f"{model_save_path}_best.keras",
             monitor="val_accuracy",
             save_best_only=True,
@@ -289,7 +334,7 @@ def _create_optimized_callbacks(
         ),
         # Cosine annealing for better convergence
         keras.callbacks.LearningRateScheduler(
-            lambda epoch: 0.001 * (0.5 * (1 + np.cos(np.pi * epoch / 50))), verbose=0
+            lambda epoch: 0.001 * (0.5 * (1 + np.cos(np.pi * epoch / 50))), verbose=1
         ),
     ]
 
@@ -373,8 +418,8 @@ def train_model(
     history = model.fit(**fit_kwargs)
 
     # Save final model
-    model.save(f"{model_save_path}_final.keras")
-    print(f"Model saved to {model_save_path}_final.keras")
+    model.save(f"{model_save_path}_final.keras", include_optimizer=False)
+    print(f"Model saved to {model_save_path}_final.keras (no optimizer state)")
 
     # Save vocabulary info
     vocab_save_path = f"{model_save_path}_vocab.json"
@@ -396,7 +441,9 @@ def train_model(
 
     # Evaluate model
     print("\nFinal evaluation:")
-    val_loss, val_accuracy = model.evaluate(val_ds, verbose=0)
+    val_loss, val_accuracy = model.evaluate(
+        val_ds, steps=vocab_info["val_steps_per_epoch"], verbose=1
+    )
     print(f"Validation Loss: {val_loss:.4f}")
     print(f"Validation Accuracy: {val_accuracy:.4f}")
 
@@ -553,7 +600,7 @@ def train_ensemble_model(
     print(f"Creating ensemble of {num_models} models...")
     models = create_ensemble_model(vocab_info, num_models)
 
-    trained_models = []
+    trained_models: List[Model] = []
     dataset_size = vocab_info["metadata"]["total_records"]
     individual_metrics = []
 
@@ -595,7 +642,7 @@ def train_ensemble_model(
         model.fit(**fit_kwargs)
 
         # Evaluate individual model
-        val_loss, val_accuracy = model.evaluate(val_ds, verbose=0)
+        val_loss, val_accuracy = model.evaluate(val_ds, verbose=1)
         individual_metrics.append(
             {
                 "model_index": i,
@@ -607,7 +654,7 @@ def train_ensemble_model(
         )
 
         # Save individual model
-        model.save(f"{model_save_path}_model_{i}_final.keras")
+        model.save(f"{model_save_path}_model_{i}_final.keras", include_optimizer=False)
         trained_models.append(model)
         tqdm.write(f"Model {i + 1} completed - Accuracy: {val_accuracy:.4f}")
 
@@ -618,7 +665,10 @@ def train_ensemble_model(
     for model in tqdm(
         trained_models, desc="Evaluating ensemble models", unit="model", leave=False
     ):
-        predictions = model.predict(val_ds, verbose=0)
+        # val_ds is repeated() (infinite); bound predict with steps to avoid hanging
+        predictions = model.predict(
+            val_ds, steps=vocab_info["val_steps_per_epoch"], verbose=1
+        )
         ensemble_predictions.append(predictions)
 
     # Calculate ensemble metrics
@@ -730,7 +780,7 @@ def evaluate_with_cross_validation(
         # Simple training for CV (reduced epochs)
         callbacks = [
             keras.callbacks.EarlyStopping(
-                monitor="val_loss", patience=3, restore_best_weights=True, verbose=0
+                monitor="val_loss", patience=3, restore_best_weights=True, verbose=1
             ),
         ]
 
@@ -746,7 +796,7 @@ def evaluate_with_cross_validation(
             steps_per_epoch=vocab_info["train_steps_per_epoch"] // 2,
             validation_steps=vocab_info["val_steps_per_epoch"] // 4,
             callbacks=callbacks,
-            verbose=0,
+            verbose=1,
         )
 
         # Get best validation accuracy from history
