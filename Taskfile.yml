@@ -21,3 +21,34 @@ tasks:
     - uv run export-track-data --output ./track_data_export
   train-model:
     - uv run src/imt_ml/tfrecord_reader.py
+  distributed-sync-tune:
+    desc: Synchronous multi-worker hyperparameter tuning across machines
+    cmds:
+      - >-
+        uv run src/imt_ml/distributed_launcher.py sync-tune
+        --workers ${WORKERS}
+        --index ${INDEX}
+        --data-dir ${DATA_DIR}
+        --project-name ${PROJECT_NAME:-track_tuning}
+        --max-epochs ${MAX_EPOCHS:-50}
+        --factor ${FACTOR:-3}
+        --hyperband-iterations ${HYPERBAND_ITERATIONS:-1}
+        --executions-per-trial ${EXECUTIONS_PER_TRIAL:-2}
+        --batch-size ${BATCH_SIZE:-32}
+        --model-path ${MODEL_PATH:-track_prediction_model_tuned}
+  distributed-tuner-parallel:
+    desc: Parallel hyperparameter trials across machines sharing a directory
+    cmds:
+      - >-
+        uv run src/imt_ml/distributed_launcher.py tuner-parallel
+        --tuner-directory ${TUNER_DIRECTORY}
+        --tuner-id ${TUNER_ID}
+        --data-dir ${DATA_DIR}
+        --project-name ${PROJECT_NAME:-track_tuning}
+        --max-epochs ${MAX_EPOCHS:-50}
+        --factor ${FACTOR:-3}
+        --hyperband-iterations ${HYPERBAND_ITERATIONS:-1}
+        --executions-per-trial ${EXECUTIONS_PER_TRIAL:-2}
+        --batch-size ${BATCH_SIZE:-32}
+        --model-path ${MODEL_PATH:-track_prediction_model_tuned}
+        ${TRAIN_BEST:+--train-best}

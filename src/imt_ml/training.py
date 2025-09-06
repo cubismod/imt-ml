@@ -77,6 +77,7 @@ def tune_hyperparameters(
     batch_size: int = 32,
     distributed: bool = False,
     executions_per_trial: int = 2,
+    directory: str | None = None,
 ) -> kt.Tuner:
     """Tune hyperparameters using Keras Tuner Hyperband algorithm."""
 
@@ -103,6 +104,7 @@ def tune_hyperparameters(
                 executions_per_trial=executions_per_trial,
                 project_name=project_name,
                 overwrite=True,
+                directory=directory,
                 distribution_strategy=strategy,
             )
     else:
@@ -115,6 +117,7 @@ def tune_hyperparameters(
             executions_per_trial=executions_per_trial,
             project_name=project_name,
             overwrite=True,
+            directory=directory,
         )
 
     print(

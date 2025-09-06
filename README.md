@@ -95,6 +95,84 @@ uv run src/imt_ml/tfrecord_reader.py track_data_export/2024-01-15_12-30-45 tune 
   --distributed
 ```
 
+## Distributed Training & Tuning
+
+Two supported setups let you use multiple machines (e.g., your MacBook and a desktop).
+
+### Synchronous Multi-Worker (single trial across machines)
+
+- Runs a single training job distributed across both hosts using TensorFlow `MultiWorkerMirroredStrategy`.
+- Requirements:
+  - Same Python/TensorFlow/Keras versions on both machines; `export KERAS_BACKEND=tensorflow`.
+  - Both machines can read the same dataset path (`--data-dir`) and can reach each other over the network.
+
+Run on each machine, replacing IPs/ports and paths:
+
+```bash
+# MacBook (index 0)
+uv run src/imt_ml/distributed_launcher.py sync-tune \
+  --workers 192.168.1.10:2222,192.168.1.11:2222 \
+  --index 0 \
+  --data-dir /shared/data \
+  --project-name track_tuning
+
+# Desktop (index 1)
+uv run src/imt_ml/distributed_launcher.py sync-tune \
+  --workers 192.168.1.10:2222,192.168.1.11:2222 \
+  --index 1 \
+  --data-dir /shared/data \
+  --project-name track_tuning
+```
+
+Taskfile target (set env vars before running):
+
+```bash
+export WORKERS=192.168.1.10:2222,192.168.1.11:2222
+export INDEX=0  # or 1 on the desktop
+export DATA_DIR=/shared/data
+task distributed-sync-tune
+```
+
+Notes:
+- Worker 0 acts as chief and will train/save the final best model and report.
+- Mixed hardware is supported; job speed is limited by the slowest worker.
+
+### Parallel Tuner Trials (multiple trials in parallel)
+
+- Each machine runs separate trials; they share a Keras Tuner state directory to coordinate.
+- Faster exploration of hyperparameters; each trial trains locally on that machine.
+
+Run on each machine with a shared directory (NFS/SMB):
+
+```bash
+# MacBook (chief)
+uv run src/imt_ml/distributed_launcher.py tuner-parallel \
+  --tuner-directory /mnt/shared/kt_runs \
+  --tuner-id chief \
+  --data-dir /shared/data \
+  --project-name track_tuning
+
+# Desktop (worker)
+uv run src/imt_ml/distributed_launcher.py tuner-parallel \
+  --tuner-directory /mnt/shared/kt_runs \
+  --tuner-id tuner0 \
+  --data-dir /shared/data \
+  --project-name track_tuning
+```
+
+Taskfile target (set env vars before running):
+
+```bash
+export TUNER_DIRECTORY=/mnt/shared/kt_runs
+export TUNER_ID=chief  # or tuner0, tuner1, ... on other machines
+export DATA_DIR=/shared/data
+task distributed-tuner-parallel
+```
+
+Notes:
+- By default only the `chief` trains/saves the final best model; add `--train-best` on any instance to change that.
+- You can combine this with GPUs on the desktop and CPU-only on the Mac; each trial uses whatever hardware is available locally.
+
 ### Ensemble Training
 ```bash
 # Train multiple models for improved accuracy
@@ -135,10 +213,14 @@ All training outputs are automatically saved in timestamped subdirectories under
 
 Each training mode saves:
 - `{model_path}_final.keras` - Final trained model
-- `{model_path}_best.keras` - Best model during training (from ModelCheckpoint callback)
+- `{model_path}_best.keras` - Best model during training
 - `{model_path}_vocab.json` - Vocabulary mappings for categorical features
 - `{model_path}_config.json` - Model configuration and hyperparameters (tune mode only)
 - `training_report.md` - **Comprehensive performance and configuration report**
+
+Loading notes:
+- For inference, load checkpoints with `compile=False` to skip optimizer restore.
+- During tuning, best checkpoints include optimizer state to support resume; for inference use `compile=False`.
 
 #### Output Directory Configuration
 
