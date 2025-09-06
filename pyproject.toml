@@ -14,7 +14,7 @@ authors = [
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11,<4.0"
-dynamic = ["version"]
+version = "1.0.0"
 
 # https://pypi.org/classifiers/
 # Adjust as needed:
@@ -40,11 +40,11 @@ dependencies = [
     "pydantic>=2.11.7",
     "redis>=6.2.0",
     "tensorflow>=2.19.0",
-    "tensorflow-metal>=1.2.0",
     "keras-tuner>=1.4.7",
     "tqdm>=4.67.1",
     "scikit-learn>=1.7.1",
     "click>=8.2.1",
+    "tensorflow[and-cuda]>=2.19.0 ; sys_platform == 'linux'",
 ]
 
 
@@ -73,23 +73,8 @@ train-model = "imt_ml.tfrecord_reader:cli"
 # https://github.com/ninoseki/uv-dynamic-versioning/
 
 [build-system]
-requires = ["hatchling", "uv-dynamic-versioning"]
+requires = ["hatchling"]
 build-backend = "hatchling.build"
-
-[tool.hatch.version]
-source = "uv-dynamic-versioning"
-# Note JSON schemas don't seem to be right for tool.hatch.version.source so
-# this may cause false warnings in IDEs.
-# https://github.com/ninoseki/uv-dynamic-versioning/issues/21
-
-[tool.uv-dynamic-versioning]
-vcs = "git"
-style = "pep440"
-bump = "true"
-
-[tool.hatch.build.targets.wheel]
-# The source location for the package.
-packages = ["src/imt_ml"]
 
 
 # ---- Settings ----
