@@ -15,7 +15,6 @@ import numpy as np
 import tensorflow as tf
 from keras import Model
 from tqdm import tqdm
-from tqdm.keras import TqdmCallback
 
 from imt_ml.dataset import load_tfrecord_dataset
 from imt_ml.models import (
@@ -468,7 +467,9 @@ def tune_hyperparameters_ray(
                     "epoch": int(epoch),
                 }
                 # Report metrics as top-level keys so schedulers can see `val_accuracy`
-                tune.report(**metrics)
+                # Ray Train/Tune in this environment expects a single metrics dict.
+                # Passing kwargs (e.g., val_accuracy=...) raises TypeError.
+                tune.report(metrics)
 
         callbacks = [
             keras.callbacks.EarlyStopping(
