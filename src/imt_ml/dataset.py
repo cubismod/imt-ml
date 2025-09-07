@@ -196,9 +196,12 @@ def load_tfrecord_dataset(
 
     # Create dataset with interleaved parallel file reading
     dataset = tf.data.Dataset.from_tensor_slices([str(f) for f in tfrecord_files])
+    # Choose a safe, bounded cycle_length. tf.data.AUTOTUNE is a sentinel (-1),
+    # so don't combine it with min(); instead cap by a small integer.
+    cycle_len = max(1, min(len(tfrecord_files), 8))
     dataset = dataset.interleave(
         tf.data.TFRecordDataset,
-        cycle_length=min(len(tfrecord_files), tf.data.AUTOTUNE),
+        cycle_length=cycle_len,
         num_parallel_calls=tf.data.AUTOTUNE,
         deterministic=False,  # Allow reordering for better performance
     )

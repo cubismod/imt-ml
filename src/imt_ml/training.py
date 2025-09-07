@@ -28,6 +28,204 @@ from imt_ml.models import (
 )
 
 
+def _maybe_import_ray_train() -> tuple[Any, Any, Any] | None:
+    """Lazily import ray.train TensorFlow trainer and configs.
+
+    Returns (TensorflowTrainer, ScalingConfig, RunConfig) if available, else None.
+    """
+    try:  # Import lazily to avoid hard dependency at module import time
+        from ray.air.config import RunConfig, ScalingConfig  # type: ignore
+        from ray.train.tensorflow import TensorflowTrainer  # type: ignore
+
+        return TensorflowTrainer, ScalingConfig, RunConfig
+    except Exception:
+        return None
+
+
+def _ray_tf_train(
+    *,
+    data_dir: str,
+    epochs: int,
+    batch_size: int,
+    model_save_path: str,
+    model_kind: str,
+    learning_rate: float = 0.001,
+    model_config: dict[str, Any] | None = None,
+    use_class_weights: bool = True,
+    num_workers: int = 1,
+    use_gpu: bool = False,
+) -> dict[str, Any]:
+    """Run training with ray.train (TensorflowTrainer) and return result info.
+
+    Saves a Keras model inside the Ray checkpoint and then writes
+    `<model_save_path>_final.keras` in the driver after training completes.
+    """
+    maybe = _maybe_import_ray_train()
+    if maybe is None:
+        raise RuntimeError(
+            "ray[train] is required for Ray-based training. Ensure it is installed."
+        )
+
+    TensorflowTrainer, ScalingConfig, RunConfig = maybe
+
+    # Define per-worker train loop
+    def train_loop_per_worker(config: dict[str, Any]) -> None:
+        # Best-effort device setup to avoid GPU allocator issues
+        try:
+            import os as _os
+
+            from ray.train import get_context as _get_context  # type: ignore
+
+            world_rank = _get_context().get_world_rank() if _get_context() else 0
+            if not config.get("use_gpu", False):
+                _os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+                try:
+                    tf.config.set_visible_devices([], "GPU")
+                except Exception:
+                    pass
+            else:
+                try:
+                    gpus = tf.config.list_physical_devices("GPU")
+                    for g in gpus:
+                        try:
+                            tf.config.experimental.set_memory_growth(g, True)
+                        except Exception:
+                            pass
+                    if world_rank == 0:
+                        logical = tf.config.list_logical_devices("GPU")
+                        print(
+                            f"[Ray Train] GPUs: {len(gpus)} physical, {len(logical)} logical"
+                        )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Load dataset per worker
+        train_ds, val_ds, vocab_info = load_tfrecord_dataset(
+            config["data_dir"], batch_size=config["batch_size"], augment_data=True
+        )
+
+        # Build model
+        if config["model_kind"] == "simple":
+            model = create_simple_model(vocab_info, use_regularization=True)
+        elif config["model_kind"] == "from_config":
+            model = build_model_from_config(config["model_config"], vocab_info)
+        else:
+            raise ValueError(f"Unknown model_kind: {config['model_kind']}")
+
+        optimizer = keras.optimizers.Adam(learning_rate=config["learning_rate"])
+        model.compile(
+            optimizer=optimizer,
+            loss="sparse_categorical_crossentropy",
+            metrics=["accuracy"],
+        )
+
+        # Report metrics back to Ray Train
+        class _RayTrainReportCallback(keras.callbacks.Callback):  # type: ignore[misc]
+            def on_epoch_end(self, epoch: int, logs: dict[str, float] | None = None):
+                try:
+                    from ray.train import session as _session  # type: ignore
+
+                    logs = logs or {}
+                    _session.report(  # type: ignore[attr-defined]
+                        {
+                            "epoch": int(epoch),
+                            "accuracy": float(logs.get("accuracy", 0.0)),
+                            "loss": float(logs.get("loss", 0.0)),
+                            "val_accuracy": float(logs.get("val_accuracy", 0.0)),
+                            "val_loss": float(logs.get("val_loss", 0.0)),
+                        }
+                    )
+                except Exception:
+                    pass
+
+        callbacks: list[keras.callbacks.Callback] = [
+            keras.callbacks.EarlyStopping(
+                monitor="val_loss", patience=2, restore_best_weights=True, verbose=1
+            ),
+            keras.callbacks.ReduceLROnPlateau(
+                monitor="val_loss", factor=0.5, patience=5, min_lr=1e-7, verbose=1
+            ),
+            _RayTrainReportCallback(),
+        ]
+
+        fit_kwargs: dict[str, Any] = {
+            "x": train_ds,
+            "validation_data": val_ds,
+            "epochs": int(config["epochs"]),
+            "steps_per_epoch": vocab_info["train_steps_per_epoch"],
+            "validation_steps": vocab_info["val_steps_per_epoch"],
+            "callbacks": callbacks,
+            "verbose": 1 if (config.get("verbose", False)) else 0,
+        }
+        if config.get("use_class_weights", True) and "class_weights" in vocab_info:
+            fit_kwargs["class_weight"] = vocab_info["class_weights"]
+
+        model.fit(**fit_kwargs)
+
+        # Save final model inside checkpoint directory
+        import os
+        import tempfile
+
+        from ray.air import Checkpoint  # type: ignore
+        from ray.train import session as _session  # type: ignore
+
+        ckpt_dir = tempfile.mkdtemp(prefix="ray_tf_model_")
+        model_out = os.path.join(ckpt_dir, "final_model.keras")
+        model.save(model_out, include_optimizer=False)
+
+        # Final evaluation for completeness
+        val_loss, val_acc = model.evaluate(
+            val_ds, steps=vocab_info["val_steps_per_epoch"], verbose=0
+        )
+        _session.report(  # type: ignore[attr-defined]
+            {"final_val_accuracy": float(val_acc), "final_val_loss": float(val_loss)},
+            checkpoint=Checkpoint.from_directory(ckpt_dir),
+        )
+
+    scaling_config = ScalingConfig(num_workers=num_workers, use_gpu=use_gpu)
+
+    # Put results under project output directory for easier discovery by users
+    run_config = RunConfig(name=model_save_path.rsplit("/", 1)[-1])
+
+    trainer = TensorflowTrainer(
+        train_loop_per_worker=train_loop_per_worker,
+        train_loop_config={
+            "data_dir": data_dir,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "model_kind": model_kind,
+            "model_config": model_config or {},
+            "use_class_weights": use_class_weights,
+            "use_gpu": use_gpu,
+            "verbose": True,
+        },
+        scaling_config=scaling_config,
+        run_config=run_config,
+    )
+
+    result = trainer.fit()
+
+    # Persist the checkpointed Keras model to the expected path
+    model_path = f"{model_save_path}_final.keras"
+    if result.checkpoint is not None:
+        import os
+        import shutil
+        import tempfile
+
+        tmpdir = tempfile.mkdtemp(prefix="ray_tf_ckpt_")
+        local_dir = result.checkpoint.to_directory(tmpdir)
+        src_model = os.path.join(local_dir, "final_model.keras")
+        if os.path.exists(src_model):
+            shutil.move(src_model, model_path)
+
+    metrics = dict(result.metrics)
+    metrics["model_path"] = model_path
+    return metrics
+
+
 class _ModelCheckpointNoOptimizer(keras.callbacks.Callback):  # type: ignore[misc]
     """Checkpoint that saves the full model without optimizer state.
 
@@ -176,8 +374,16 @@ def tune_hyperparameters_ray(
     directory: str | None = None,
     gpus_per_trial: float = 0.0,
     cpus_per_trial: float | None = None,
+    *,
+    use_bohb: bool = False,
+    bohb_max_concurrent: int | None = None,
+    use_pbt: bool = False,
+    pbt_perturbation_interval: int = 3,
 ) -> dict[str, Any]:
-    """Tune hyperparameters using Ray Tune with ASHA early stopping.
+    """Tune hyperparameters using Ray Tune.
+
+    Defaults to ASHA scheduler. If `use_bohb` is True, uses BOHB
+    (HyperBandForBOHB + TuneBOHB search algorithm).
 
     Returns the best config dict found by Ray.
     """
@@ -187,7 +393,16 @@ def tune_hyperparameters_ray(
 
         import ray  # type: ignore
         from ray import tune  # type: ignore
-        from ray.tune.schedulers import ASHAScheduler  # type: ignore
+        from ray.tune.schedulers import (
+            ASHAScheduler,
+            HyperBandForBOHB,
+            PopulationBasedTraining,
+        )  # type: ignore
+
+        if use_bohb:
+            # Imported lazily only if requested
+            from ray.tune.search import ConcurrencyLimiter  # type: ignore
+            from ray.tune.search.bohb import TuneBOHB  # type: ignore
     except Exception as e:  # pragma: no cover
         raise RuntimeError(
             "Ray Tune is required for tune_hyperparameters_ray. Install ray[tune]."
@@ -199,6 +414,41 @@ def tune_hyperparameters_ray(
         ray.init(runtime_env={"env_vars": {"UV_ACTIVE": "1"}})  # type: ignore[call-arg]
 
     def trainable(config: dict[str, Any]):
+        # Avoid TensorFlow GPU initialization issues in Ray workers when not using GPUs.
+        # Must be done before any TensorFlow ops create tensors or access devices.
+        try:  # defensive: never let TF device config crash the worker
+            import os as _os
+
+            if float(gpus_per_trial or 0.0) == 0.0:
+                # Hide GPUs from TF entirely for CPU-only trials
+                _os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+                try:
+                    tf.config.set_visible_devices([], "GPU")
+                except Exception:
+                    # set_visible_devices may raise if called after devices are initialized
+                    pass
+            else:
+                # When using GPUs, enable memory growth to reduce OOM / allocator issues
+                try:
+                    _gpus = tf.config.list_physical_devices("GPU")
+                    for _gpu in _gpus:
+                        try:
+                            tf.config.experimental.set_memory_growth(_gpu, True)
+                        except Exception:
+                            pass
+                    # Log visible GPUs for transparency
+                    _logical = tf.config.list_logical_devices("GPU")
+                    print(
+                        f"[Ray Trial] Visible GPUs: {len(_gpus)} physical, {len(_logical)} logical"
+                    )
+                    if _gpus:
+                        names = [getattr(g, "name", "GPU") for g in _gpus]
+                        print(f"[Ray Trial] GPU devices: {names}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # Load dataset per trial to avoid cross-trial state
         train_ds, val_ds, vocab_info = load_tfrecord_dataset(
             data_dir, batch_size=batch_size
@@ -215,10 +465,10 @@ def tune_hyperparameters_ray(
                     "val_loss": float(logs.get("val_loss", 0.0)),
                     "accuracy": float(logs.get("accuracy", 0.0)),
                     "loss": float(logs.get("loss", 0.0)),
-                    "epoch": epoch,
+                    "epoch": int(epoch),
                 }
-                # Report metrics via Tune as a dict (compatible across Ray versions)
-                tune.report(metrics=metrics)
+                # Report metrics as top-level keys so schedulers can see `val_accuracy`
+                tune.report(**metrics)
 
         callbacks = [
             keras.callbacks.EarlyStopping(
@@ -250,27 +500,74 @@ def tune_hyperparameters_ray(
         config_space[f"units_{i}"] = tune.randint(8, 257)
         config_space[f"dropout_{i}"] = tune.uniform(0.01, 0.6)
 
-    scheduler = ASHAScheduler(
-        time_attr="training_iteration",
-        metric="val_accuracy",
-        mode="max",
-        grace_period=asha_grace_period,
-        reduction_factor=asha_reduction_factor,
-        max_t=max_epochs,
-    )
+    scheduler: Any
+    search_alg: Any | None
+    if use_bohb:
+        # BOHB scheduler. Note: grace_period is not used by BOHB.
+        scheduler = HyperBandForBOHB(
+            time_attr="training_iteration",
+            metric="val_accuracy",
+            mode="max",
+            max_t=max_epochs,
+            reduction_factor=asha_reduction_factor,
+        )
+        # Use BOHB search algorithm as well
+        bohb_search = TuneBOHB()
+        if bohb_max_concurrent and bohb_max_concurrent > 0:
+            search_alg = ConcurrencyLimiter(
+                bohb_search, max_concurrent=bohb_max_concurrent
+            )
+        else:
+            search_alg = bohb_search
+    elif use_pbt:
+        # Population Based Training schedule
+        scheduler = PopulationBasedTraining(
+            time_attr="training_iteration",
+            metric="val_accuracy",
+            mode="max",
+            perturbation_interval=pbt_perturbation_interval,
+            hyperparam_mutations={
+                # Explore learning rates
+                "learning_rate": [1e-4, 5e-4, 1e-3, 5e-3],
+                # Explore embedding sizes
+                "station_embedding_dim": [8, 16, 24, 32, 40, 48, 56, 64],
+                "route_embedding_dim": [4, 8, 12, 16, 24, 32, 40, 48, 56, 64],
+                "direction_embedding_dim": [2, 4, 6, 8, 12, 16, 24, 32],
+                # Explore depth
+                "num_layers": list(range(2, max_layers + 1)),
+            },
+        )
+        search_alg = None
+    else:
+        # Default scheduler: ASHA
+        scheduler = ASHAScheduler(
+            time_attr="training_iteration",
+            metric="val_accuracy",
+            mode="max",
+            grace_period=asha_grace_period,
+            reduction_factor=asha_reduction_factor,
+            max_t=max_epochs,
+        )
+        search_alg = None
 
     trainable_with_resources = tune.with_resources(
         trainable, resources={"cpu": (cpus_per_trial or 1), "gpu": gpus_per_trial}
     )
 
+    run_kwargs: dict[str, Any] = {
+        "name": project_name,
+        "scheduler": scheduler,
+        "num_samples": num_samples,
+        "local_dir": directory,  # may be None, Ray defaults to ~/ray_results
+        "config": config_space,
+        "verbose": 1,
+    }
+    if search_alg is not None:
+        run_kwargs["search_alg"] = search_alg
+
     analysis = tune.run(
         trainable_with_resources,
-        name=project_name,
-        scheduler=scheduler,
-        num_samples=num_samples,
-        local_dir=directory,  # may be None, Ray defaults to ~/ray_results
-        config=config_space,
-        verbose=1,
+        **run_kwargs,
     )
 
     # Explicitly provide metric/mode when fetching best config to avoid Tune API warnings
@@ -300,76 +597,71 @@ def train_best_model_from_config(
     model_save_path: str = "track_prediction_model_tuned",
     tuning_time: float = 0.0,
     generate_report_func=None,
+    *,
+    use_ray_train: bool = False,
+    num_workers: int = 1,
+    use_gpu: bool = False,
+    tuning_algorithm: str | None = None,
 ) -> keras.Model:
     """Train a model using a Ray Tune best config and save artifacts."""
     start_time = time.time()
 
-    # Load dataset
+    # Load dataset (driver) for metadata and evaluation below
     train_ds, val_ds, vocab_info = load_tfrecord_dataset(
         data_dir, batch_size=batch_size
     )
 
-    # Build model from best config
-    model = build_model_from_config(best_config, vocab_info)
-
-    # Log and train
     print("Training best model with Ray-derived hyperparameters:")
     for k, v in best_config.items():
         print(f"  {k}: {v}")
 
-    callbacks = [
-        keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=2, restore_best_weights=True, verbose=1
-        ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5, patience=5, min_lr=1e-7, verbose=1
-        ),
-        _ModelCheckpointNoOptimizer(
-            filepath=f"{model_save_path}_best.keras",
-            monitor="val_accuracy",
-            save_best_only=True,
+    history_like: dict[str, list[float]] | None = None
+    if use_ray_train:
+        # Train via Ray Train using the config
+        _ = _ray_tf_train(
+            data_dir=data_dir,
+            epochs=epochs,
+            batch_size=batch_size,
+            model_save_path=model_save_path,
+            model_kind="from_config",
+            model_config=best_config,
+            learning_rate=float(best_config.get("learning_rate", 1e-3)),
+            use_class_weights=True,
+            num_workers=num_workers,
+            use_gpu=use_gpu,
+        )
+        # No history timeline from Ray path; will compute metrics below
+    else:
+        # Local training path
+        model = build_model_from_config(best_config, vocab_info)
+        callbacks = [
+            keras.callbacks.EarlyStopping(
+                monitor="val_loss", patience=2, restore_best_weights=True, verbose=1
+            ),
+            keras.callbacks.ReduceLROnPlateau(
+                monitor="val_loss", factor=0.5, patience=5, min_lr=1e-7, verbose=1
+            ),
+            _ModelCheckpointNoOptimizer(
+                filepath=f"{model_save_path}_best.keras",
+                monitor="val_accuracy",
+                save_best_only=True,
+                verbose=1,
+            ),
+        ]
+
+        history = model.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=epochs,
+            steps_per_epoch=vocab_info["train_steps_per_epoch"],
+            validation_steps=vocab_info["val_steps_per_epoch"],
+            callbacks=callbacks,
             verbose=1,
-        ),
-        TqdmCallback(verbose=1, epochs_desc="Training Progress", steps_desc="Step"),
-    ]
+        )
 
-    history = model.fit(
-        train_ds,
-        validation_data=val_ds,
-        epochs=epochs,
-        steps_per_epoch=vocab_info["train_steps_per_epoch"],
-        validation_steps=vocab_info["val_steps_per_epoch"],
-        callbacks=callbacks,
-        verbose=1,
-    )
-
-    model.save(f"{model_save_path}_final.keras", include_optimizer=False)
-    print(f"Model saved to {model_save_path}_final.keras (no optimizer state)")
-
-    # Save hyperparameters and vocabulary info
-    save_path = f"{model_save_path}_config.json"
-    config = {
-        "hyperparameters": best_config,
-        "vocabulary": {
-            "station_vocab": vocab_info["station_vocab"],
-            "route_vocab": vocab_info["route_vocab"],
-            "track_vocab": vocab_info["track_vocab"],
-            "num_stations": vocab_info["num_stations"],
-            "num_routes": vocab_info["num_routes"],
-            "num_tracks": vocab_info["num_tracks"],
-        },
-    }
-    with open(save_path, "w") as f:
-        json.dump(config, f, indent=2)
-    print(f"Configuration saved to {save_path}")
-
-    # Evaluate model
-    print("\nFinal evaluation:")
-    val_loss, val_accuracy = model.evaluate(
-        val_ds, steps=vocab_info["val_steps_per_epoch"], verbose=1
-    )
-    print(f"Validation Loss: {val_loss:.4f}")
-    print(f"Validation Accuracy: {val_accuracy:.4f}")
+        model.save(f"{model_save_path}_final.keras", include_optimizer=False)
+        print(f"Model saved to {model_save_path}_final.keras (no optimizer state)")
+        history_like = {k: list(v) for k, v in history.history.items()}
 
     # Calculate total time
     final_training_time = time.time() - start_time
@@ -381,23 +673,61 @@ def train_best_model_from_config(
             "epochs": epochs,
             "batch_size": batch_size,
             "dataset_size": vocab_info["metadata"]["total_records"],
-            "tuning_algorithm": "Ray Tune ASHA",
+            "tuning_algorithm": tuning_algorithm or "Ray Tune ASHA",
         }
 
+        # Save hyperparameters and vocabulary info for traceability
+        save_path = f"{model_save_path}_config.json"
+        config = {
+            "hyperparameters": best_config,
+            "vocabulary": {
+                "station_vocab": vocab_info["station_vocab"],
+                "route_vocab": vocab_info["route_vocab"],
+                "track_vocab": vocab_info["track_vocab"],
+                "num_stations": vocab_info["num_stations"],
+                "num_routes": vocab_info["num_routes"],
+                "num_tracks": vocab_info["num_tracks"],
+            },
+        }
+        with open(save_path, "w") as f:
+            json.dump(config, f, indent=2)
+        print(f"Configuration saved to {save_path}")
+
+        # Load the saved model and evaluate for consistent metrics
+        loaded = keras.models.load_model(
+            f"{model_save_path}_final.keras", compile=False
+        )
+        loaded.compile(
+            optimizer=keras.optimizers.Adam(),
+            loss="sparse_categorical_crossentropy",
+            metrics=["accuracy"],
+        )
+        val_loss, val_accuracy = loaded.evaluate(
+            val_ds, steps=vocab_info["val_steps_per_epoch"], verbose=0
+        )
+
         final_metrics = {
-            "validation_loss": val_loss,
-            "validation_accuracy": val_accuracy,
-            "total_epochs_trained": len(history.history["loss"]),
-            "best_validation_accuracy": max(history.history.get("val_accuracy", [0.0])),
-            "best_validation_loss": min(
-                history.history.get("val_loss", [float("inf")])
+            "validation_loss": float(val_loss),
+            "validation_accuracy": float(val_accuracy),
+            "total_epochs_trained": (
+                len(history_like["loss"]) if history_like else epochs
+            ),
+            "best_validation_accuracy": (
+                max(history_like.get("val_accuracy", [0.0]))
+                if history_like
+                else float(val_accuracy)
+            ),
+            "best_validation_loss": (
+                min(history_like.get("val_loss", [float(val_loss)]))
+                if history_like
+                else float(val_loss)
             ),
         }
 
         additional_info = {
             "final_training_time": final_training_time,
             "total_time": total_time,
-            "model_parameters": model.count_params(),
+            "model_parameters": loaded.count_params(),
             "optimization_objective": "val_accuracy",
             "best_hyperparameters": best_config,
         }
@@ -412,7 +742,7 @@ def train_best_model_from_config(
             additional_info,
         )
 
-    return model
+    return keras.models.load_model(f"{model_save_path}_final.keras", compile=False)
 
 
 def train_best_model(
@@ -459,7 +789,6 @@ def train_best_model(
             save_best_only=True,
             verbose=1,
         ),
-        TqdmCallback(verbose=1, epochs_desc="Training Progress", steps_desc="Step"),
     ]
 
     print(f"Training model for {epochs} epochs...")
@@ -647,62 +976,95 @@ def train_model(
     print(f"  Routes: {vocab_info['num_routes']}")
     print(f"  Tracks: {vocab_info['num_tracks']}")
 
-    # Create and compile model with regularization
-    print("Creating model with regularization...")
-    model = create_simple_model(vocab_info, use_regularization=True)
+    # Decide on local vs Ray Train path
+    use_ray_env = False
+    num_workers = 1
+    use_gpu = False
+    # Allow enabling via environment flags without changing signature (non-breaking)
+    # IMT_RAY_TRAIN=1 enables Ray Train with defaults; IMT_RAY_WORKERS/IMT_RAY_GPU tweak it.
+    try:
+        import os as _os
 
-    # Use adaptive learning rate based on dataset size
-    adaptive_lr = learning_rate * (
-        0.5 if vocab_info["metadata"]["total_records"] < 5000 else 1.0
-    )
-    optimizer = keras.optimizers.Adam(
-        learning_rate=adaptive_lr,
-        beta_1=0.9,
-        beta_2=0.999,
-        epsilon=1e-7,  # Smaller epsilon for better precision
-    )
+        use_ray_env = _os.environ.get("IMT_RAY_TRAIN", "0") == "1"
+        num_workers = int(_os.environ.get("IMT_RAY_WORKERS", "1"))
+        use_gpu = _os.environ.get("IMT_RAY_GPU", "0") == "1"
+    except Exception:
+        pass
 
-    # Compile with class weights if requested
-    compile_kwargs = {
-        "optimizer": optimizer,
-        "loss": "sparse_categorical_crossentropy",
-        "metrics": ["accuracy", "top_k_categorical_accuracy"],
-    }
-
-    model.compile(**compile_kwargs)
-
-    print(model.summary())
-
-    # Setup optimized callbacks
+    # Common dataset size for reporting
     dataset_size = vocab_info["metadata"]["total_records"]
-    callbacks = _create_optimized_callbacks(
-        model_save_path, dataset_size, epochs=epochs
-    )
-    callbacks.append(
-        TqdmCallback(verbose=1, epochs_desc="Training Progress", steps_desc="Step")
-    )
 
-    # Train model with class weights for imbalanced data
-    print(f"Training model for {epochs} epochs...")
-    fit_kwargs = {
-        "x": train_ds,
-        "validation_data": val_ds,
-        "epochs": epochs,
-        "steps_per_epoch": vocab_info["train_steps_per_epoch"],
-        "validation_steps": vocab_info["val_steps_per_epoch"],
-        "callbacks": callbacks,
-        "verbose": 1,
-    }
+    if use_ray_env:
+        print(
+            f"Using ray.train with num_workers={num_workers}, use_gpu={use_gpu} for training"
+        )
+        _ = _ray_tf_train(
+            data_dir=data_dir,
+            epochs=epochs,
+            batch_size=batch_size,
+            model_save_path=model_save_path,
+            model_kind="simple",
+            learning_rate=learning_rate,
+            use_class_weights=use_class_weights,
+            num_workers=num_workers,
+            use_gpu=use_gpu,
+        )
+        # Continue to save metadata and evaluate below using the saved model
+    else:
+        # Create and compile model with regularization
+        print("Creating model with regularization...")
+        model = create_simple_model(vocab_info, use_regularization=True)
 
-    if use_class_weights and "class_weights" in vocab_info:
-        fit_kwargs["class_weight"] = vocab_info["class_weights"]
-        print(f"Using class weights for {len(vocab_info['class_weights'])} classes")
+        # Use adaptive learning rate based on dataset size
+        adaptive_lr = learning_rate * (
+            0.5 if vocab_info["metadata"]["total_records"] < 5000 else 1.0
+        )
+        optimizer = keras.optimizers.Adam(
+            learning_rate=adaptive_lr,
+            beta_1=0.9,
+            beta_2=0.999,
+            epsilon=1e-7,  # Smaller epsilon for better precision
+        )
 
-    history = model.fit(**fit_kwargs)
+        # Compile with class weights if requested
+        compile_kwargs = {
+            "optimizer": optimizer,
+            "loss": "sparse_categorical_crossentropy",
+            "metrics": ["accuracy", "top_k_categorical_accuracy"],
+        }
 
-    # Save final model
-    model.save(f"{model_save_path}_final.keras", include_optimizer=False)
-    print(f"Model saved to {model_save_path}_final.keras (no optimizer state)")
+        model.compile(**compile_kwargs)
+
+        print(model.summary())
+
+        # Setup optimized callbacks
+        dataset_size = vocab_info["metadata"]["total_records"]
+        callbacks = _create_optimized_callbacks(
+            model_save_path, dataset_size, epochs=epochs
+        )
+
+        # Train model with class weights for imbalanced data
+        print(f"Training model for {epochs} epochs...")
+        fit_kwargs = {
+            "x": train_ds,
+            "validation_data": val_ds,
+            "epochs": epochs,
+            "steps_per_epoch": vocab_info["train_steps_per_epoch"],
+            "validation_steps": vocab_info["val_steps_per_epoch"],
+            "callbacks": callbacks,
+            "verbose": 1,
+        }
+
+        if use_class_weights and "class_weights" in vocab_info:
+            fit_kwargs["class_weight"] = vocab_info["class_weights"]
+            print(f"Using class weights for {len(vocab_info['class_weights'])} classes")
+
+        history = model.fit(**fit_kwargs)
+        history_like = {k: list(v) for k, v in history.history.items()}
+
+        # Save final model
+        model.save(f"{model_save_path}_final.keras", include_optimizer=False)
+        print(f"Model saved to {model_save_path}_final.keras (no optimizer state)")
 
     # Save vocabulary info
     vocab_save_path = f"{model_save_path}_vocab.json"
@@ -722,9 +1084,17 @@ def train_model(
         )
     print(f"Vocabulary saved to {vocab_save_path}")
 
-    # Evaluate model
-    print("\nFinal evaluation:")
-    val_loss, val_accuracy = model.evaluate(
+    # Evaluate saved model
+    print("\nFinal evaluation (reloading saved model):")
+    loaded_model = keras.models.load_model(
+        f"{model_save_path}_final.keras", compile=False
+    )
+    loaded_model.compile(
+        optimizer=keras.optimizers.Adam(),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+    val_loss, val_accuracy = loaded_model.evaluate(
         val_ds, steps=vocab_info["val_steps_per_epoch"], verbose=1
     )
     print(f"Validation Loss: {val_loss:.4f}")
@@ -739,26 +1109,31 @@ def train_model(
             "epochs": epochs,
             "batch_size": batch_size,
             "learning_rate": learning_rate,
-            "adaptive_learning_rate": adaptive_lr,
+            "adaptive_learning_rate": (
+                adaptive_lr if "adaptive_lr" in locals() else learning_rate
+            ),
             "use_class_weights": use_class_weights,
             "dataset_size": dataset_size,
         }
 
+        epochs_trained = (
+            len(history_like["loss"]) if "history_like" in locals() else epochs
+        )
         final_metrics = {
             "validation_loss": val_loss,
             "validation_accuracy": val_accuracy,
-            "total_epochs_trained": len(history.history["loss"]),
+            "total_epochs_trained": epochs_trained,
         }
 
         # Add best metrics from history
-        if "val_accuracy" in history.history:
+        if "history_like" in locals() and "val_accuracy" in history_like:
             final_metrics["best_validation_accuracy"] = max(
-                history.history["val_accuracy"]
+                history_like["val_accuracy"]
             )
-            final_metrics["best_validation_loss"] = min(history.history["val_loss"])
+            final_metrics["best_validation_loss"] = min(history_like["val_loss"])
 
         additional_info = {
-            "model_parameters": model.count_params(),
+            "model_parameters": loaded_model.count_params(),
             "regularization": "L1/L2, Dropout, BatchNormalization",
             "data_augmentation": "Applied for small datasets"
             if dataset_size < 10000
@@ -775,7 +1150,11 @@ def train_model(
             additional_info,
         )
 
-    return history
+    return (
+        history
+        if "history" in locals()
+        else {"validation_loss": val_loss, "validation_accuracy": val_accuracy}
+    )
 
 
 def create_ensemble_model(

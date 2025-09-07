@@ -66,11 +66,24 @@ def cli(ctx, data_dir):
 @click.option(
     "--model-path", default="track_prediction_model", help="Model save path prefix"
 )
+@click.option("--ray-train/--no-ray-train", default=False, help="Use ray.train")
+@click.option("--num-workers", default=1, type=int, help="Ray Train workers")
+@click.option("--use-gpu/--no-use-gpu", default=False, help="Use GPU in Ray Train")
 @click.pass_context
-def train(ctx, epochs, batch_size, learning_rate, model_path):
+def train(
+    ctx, epochs, batch_size, learning_rate, model_path, ray_train, num_workers, use_gpu
+):
     """Train model with fixed hyperparameters."""
     try:
         full_model_path = create_timestamped_output_dir("train", model_path)
+        # Pass through via env to avoid changing function signature broadly
+        if ray_train:
+            import os
+
+            os.environ["IMT_RAY_TRAIN"] = "1"
+            os.environ["IMT_RAY_WORKERS"] = str(num_workers)
+            os.environ["IMT_RAY_GPU"] = "1" if use_gpu else "0"
+
         train_model(
             data_dir=ctx.obj["data_dir"],
             epochs=epochs,
@@ -205,8 +218,12 @@ def cv(ctx, k_folds, epochs, batch_size):
     help="Model save path prefix",
 )
 @click.option("--num-samples", default=20, help="Number of Ray trials")
-@click.option("--asha-grace-period", default=5, help="ASHA grace period (epochs)")
-@click.option("--asha-reduction-factor", default=3, help="ASHA reduction factor")
+@click.option(
+    "--asha-grace-period",
+    default=5,
+    help="Grace period (unused for BOHB; kept for compatibility)",
+)
+@click.option("--asha-reduction-factor", default=3, help="BOHB reduction factor (eta)")
 @click.option(
     "--ray-dir", default=None, help="Ray local dir for results (default: ~/ray_results)"
 )
@@ -215,6 +232,27 @@ def cv(ctx, k_folds, epochs, batch_size):
 )
 @click.option(
     "--cpus-per-trial", default=None, type=float, help="CPUs per Ray trial (default 1)"
+)
+@click.option(
+    "--bohb/--no-bohb", default=False, help="Use BOHB (HyperBandForBOHB + TuneBOHB)"
+)
+@click.option(
+    "--bohb-max-concurrent", default=None, type=int, help="Max concurrent BOHB trials"
+)
+@click.option(
+    "--pbt/--no-pbt", default=False, help="Use Population Based Training scheduler"
+)
+@click.option(
+    "--pbt-interval", default=3, type=int, help="PBT perturbation interval (epochs)"
+)
+@click.option(
+    "--ray-train/--no-ray-train", default=False, help="Use ray.train for final training"
+)
+@click.option(
+    "--num-workers", default=1, type=int, help="Ray Train workers for final training"
+)
+@click.option(
+    "--use-gpu/--no-use-gpu", default=False, help="Use GPU in Ray Train final training"
 )
 @click.pass_context
 def tune(
@@ -230,11 +268,25 @@ def tune(
     ray_dir,
     gpus_per_trial,
     cpus_per_trial,
+    bohb,
+    bohb_max_concurrent,
+    pbt,
+    pbt_interval,
+    ray_train,
+    num_workers,
+    use_gpu,
 ):
-    """Tune hyperparameters with Ray Tune (ASHA) and train best model."""
+    """Tune hyperparameters with Ray Tune and train best model.
+
+    Defaults to ASHA; enable --bohb to use BOHB.
+    """
     try:
         full_model_path = create_timestamped_output_dir("tune", model_path)
         tuning_start_time = time.time()
+
+        # Validate scheduler switches: allow only one of BOHB or PBT
+        if bohb and pbt:
+            raise click.ClickException("Choose only one scheduler: --bohb or --pbt")
 
         best_config = tune_hyperparameters_ray(
             data_dir=ctx.obj["data_dir"],
@@ -247,6 +299,10 @@ def tune(
             directory=ray_dir,
             gpus_per_trial=gpus_per_trial,
             cpus_per_trial=cpus_per_trial,
+            use_bohb=bohb,
+            bohb_max_concurrent=bohb_max_concurrent,
+            use_pbt=pbt,
+            pbt_perturbation_interval=pbt_interval,
         )
         tuning_time = time.time() - tuning_start_time
 
@@ -258,6 +314,14 @@ def tune(
             model_save_path=full_model_path,
             tuning_time=tuning_time,
             generate_report_func=generate_training_report,
+            tuning_algorithm=(
+                "Ray Tune BOHB"
+                if bohb
+                else ("Ray Tune PBT" if pbt else "Ray Tune ASHA")
+            ),
+            use_ray_train=ray_train,
+            num_workers=num_workers,
+            use_gpu=use_gpu,
         )
     except Exception as e:
         click.echo(f"Error during hyperparameter tuning: {e}", err=True)
