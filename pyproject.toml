@@ -69,6 +69,10 @@ dev = [
 # Add script entry points here:
 export-track-data = "imt_ml.export_track_data:run"
 train-model = "imt_ml.tfrecord_reader:cli"
+tflite-export = "imt_ml.tflite_export:cli"
+distributed-launcher = "imt_ml.distributed_launcher:cli"
+distributed-sync-tune = "imt_ml.distributed_launcher:sync_tune_cli"
+distributed-tuner-parallel = "imt_ml.distributed_launcher:tuner_parallel_cli"
 
 
 # ---- Build system ----

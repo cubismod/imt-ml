@@ -167,8 +167,8 @@ def _ray_tf_train(
         import os
         import tempfile
 
-        from ray.air import Checkpoint  # type: ignore
-        from ray.train import session as _session  # type: ignore
+        from ray.train import Checkpoint
+        from ray.train import session as _session
 
         ckpt_dir = tempfile.mkdtemp(prefix="ray_tf_model_")
         model_out = os.path.join(ckpt_dir, "final_model.keras")

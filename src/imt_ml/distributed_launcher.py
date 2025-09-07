@@ -165,3 +165,23 @@ def tuner_parallel(
 
 if __name__ == "__main__":
     cli()
+
+
+# Convenience entrypoints to call subcommands directly via console scripts
+def sync_tune_cli() -> None:
+    """Console entry for `distributed-sync-tune`.
+
+    Invokes the `sync-tune` subcommand so users can run:
+      uv run distributed-sync-tune --workers ... --index ...
+    """
+    # Use the click command object to parse argv for this subcommand
+    cli.commands["sync-tune"]()  # type: ignore[misc]
+
+
+def tuner_parallel_cli() -> None:
+    """Console entry for `distributed-tuner-parallel`.
+
+    Invokes the `tuner-parallel` subcommand so users can run:
+      uv run distributed-tuner-parallel --tuner-directory ... --tuner-id ...
+    """
+    cli.commands["tuner-parallel"]()  # type: ignore[misc]
