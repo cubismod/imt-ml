@@ -69,9 +69,73 @@ def cli(ctx, data_dir):
 @click.option("--ray-train/--no-ray-train", default=False, help="Use ray.train")
 @click.option("--num-workers", default=1, type=int, help="Ray Train workers")
 @click.option("--use-gpu/--no-use-gpu", default=False, help="Use GPU in Ray Train")
+@click.option(
+    "--optimizer",
+    type=click.Choice(["adam", "adamw"], case_sensitive=False),
+    default="adam",
+    help="Optimizer to use",
+)
+@click.option("--weight-decay", default=0.0, type=float, help="Weight decay (AdamW)")
+@click.option("--clipnorm", default=None, type=float, help="Gradient clipping norm")
+@click.option("--label-smoothing", default=0.0, type=float, help="Label smoothing")
+@click.option(
+    "--loss",
+    type=click.Choice(["ce", "focal"], case_sensitive=False),
+    default="ce",
+    help="Loss type (cross-entropy or focal)",
+)
+@click.option("--focal-gamma", default=2.0, type=float, help="Focal loss gamma")
+@click.option("--focal-alpha", default=None, type=float, help="Focal loss alpha")
+@click.option("--mixup-alpha", default=0.0, type=float, help="Mixup alpha (0 disables)")
+@click.option("--swa/--no-swa", default=False, help="Enable SWA in final phase")
+@click.option(
+    "--swa-fraction",
+    default=0.3,
+    type=float,
+    help="Fraction of epochs at end to average (SWA)",
+)
+@click.option("--warmup-epochs", default=0, type=int, help="Warmup epochs")
+@click.option(
+    "--cosine-restarts/--no-cosine-restarts",
+    default=False,
+    help="Use cosine decay restarts (disables ReduceLROnPlateau)",
+)
+@click.option(
+    "--restart-initial-period",
+    default=10,
+    type=int,
+    help="Initial period for cosine restarts",
+)
+@click.option(
+    "--restart-multiplier",
+    default=2.0,
+    type=float,
+    help="Multiplier to grow restart period",
+)
 @click.pass_context
 def train(
-    ctx, epochs, batch_size, learning_rate, model_path, ray_train, num_workers, use_gpu
+    ctx,
+    epochs,
+    batch_size,
+    learning_rate,
+    model_path,
+    ray_train,
+    num_workers,
+    use_gpu,
+    optimizer,
+    weight_decay,
+    clipnorm,
+    label_smoothing,
+    loss,
+    focal_gamma,
+    focal_alpha,
+    mixup_alpha,
+    swa,
+    swa_fraction,
+    warmup_epochs,
+    cosine_restarts,
+    restart_initial_period,
+    restart_multiplier,
 ):
     """Train model with fixed hyperparameters."""
     try:
@@ -91,6 +155,20 @@ def train(
             learning_rate=learning_rate,
             model_save_path=full_model_path,
             generate_report_func=generate_training_report,
+            optimizer_name=optimizer,
+            weight_decay=weight_decay,
+            clipnorm=clipnorm,
+            label_smoothing=label_smoothing,
+            loss_type=loss,
+            focal_gamma=focal_gamma,
+            focal_alpha=focal_alpha,
+            mixup_alpha=mixup_alpha,
+            swa=swa,
+            swa_fraction=swa_fraction,
+            warmup_epochs=warmup_epochs,
+            cosine_restarts=cosine_restarts,
+            restart_initial_period=restart_initial_period,
+            restart_mult=restart_multiplier,
         )
     except Exception as e:
         click.echo(f"Error during training: {e}", err=True)
@@ -135,6 +213,66 @@ def train(
 @click.option("--no-scheduler", is_flag=True, help="Disable cosine LR scheduler")
 @click.option("--no-early-stop", is_flag=True, help="Disable early stopping")
 @click.option(
+    "--no-temperature-scale",
+    is_flag=True,
+    help="Disable validation-based temperature scaling",
+)
+@click.option(
+    "--bagging-fraction",
+    type=float,
+    default=1.0,
+    help="Fraction of training steps per epoch per model (0.5–1.0)",
+)
+@click.option(
+    "--seed-base",
+    type=int,
+    default=42,
+    help="Base random seed; each model uses seed_base+i",
+)
+@click.option(
+    "--optimizer",
+    type=click.Choice(["adam", "adamw"], case_sensitive=False),
+    default="adam",
+    help="Optimizer to use",
+)
+@click.option("--weight-decay", default=0.0, type=float, help="Weight decay (AdamW)")
+@click.option("--clipnorm", default=None, type=float, help="Gradient clipping norm")
+@click.option("--label-smoothing", default=0.0, type=float, help="Label smoothing")
+@click.option(
+    "--loss",
+    type=click.Choice(["ce", "focal"], case_sensitive=False),
+    default="ce",
+    help="Loss type (cross-entropy or focal)",
+)
+@click.option("--focal-gamma", default=2.0, type=float, help="Focal loss gamma")
+@click.option("--focal-alpha", default=None, type=float, help="Focal loss alpha")
+@click.option("--mixup-alpha", default=0.0, type=float, help="Mixup alpha (0 disables)")
+@click.option("--swa/--no-swa", default=False, help="Enable SWA in final phase")
+@click.option(
+    "--swa-fraction",
+    default=0.3,
+    type=float,
+    help="Fraction of epochs at end to average (SWA)",
+)
+@click.option("--warmup-epochs", default=0, type=int, help="Warmup epochs")
+@click.option(
+    "--cosine-restarts/--no-cosine-restarts",
+    default=False,
+    help="Use cosine decay restarts (disables ReduceLROnPlateau)",
+)
+@click.option(
+    "--restart-initial-period",
+    default=10,
+    type=int,
+    help="Initial period for cosine restarts",
+)
+@click.option(
+    "--restart-multiplier",
+    default=2.0,
+    type=float,
+    help="Multiplier to grow restart period",
+)
+@click.option(
     "--model-path",
     default="track_prediction_ensemble",
     help="Model save path prefix",
@@ -154,6 +292,23 @@ def ensemble(
     scheduler_tmax,
     no_scheduler,
     no_early_stop,
+    no_temperature_scale,
+    bagging_fraction,
+    seed_base,
+    optimizer,
+    weight_decay,
+    clipnorm,
+    label_smoothing,
+    loss,
+    focal_gamma,
+    focal_alpha,
+    mixup_alpha,
+    swa,
+    swa_fraction,
+    warmup_epochs,
+    cosine_restarts,
+    restart_initial_period,
+    restart_multiplier,
     model_path,
 ):
     """Train ensemble of models for better accuracy."""
@@ -175,6 +330,23 @@ def ensemble(
             use_scheduler=not no_scheduler,
             scheduler_tmax=scheduler_tmax,
             use_early_stopping=not no_early_stop,
+            temperature_scale=not no_temperature_scale,
+            bagging_fraction=bagging_fraction,
+            seed_base=seed_base,
+            optimizer_name=optimizer,
+            weight_decay=weight_decay,
+            clipnorm=clipnorm,
+            label_smoothing=label_smoothing,
+            loss_type=loss,
+            focal_gamma=focal_gamma,
+            focal_alpha=focal_alpha,
+            mixup_alpha=mixup_alpha,
+            swa=swa,
+            swa_fraction=swa_fraction,
+            warmup_epochs=warmup_epochs,
+            cosine_restarts=cosine_restarts,
+            restart_initial_period=restart_initial_period,
+            restart_mult=restart_multiplier,
         )
     except Exception as e:
         click.echo(f"Error during ensemble training: {e}", err=True)

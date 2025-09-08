@@ -203,6 +203,20 @@ uv run src/imt_ml/tfrecord_reader.py track_data_export/<date> ensemble \
 # Disable early stopping or the cosine scheduler
 uv run src/imt_ml/tfrecord_reader.py track_data_export/<date> ensemble --no-early-stop
 uv run src/imt_ml/tfrecord_reader.py track_data_export/<date> ensemble --no-scheduler
+
+# Add diversity and calibration
+uv run src/imt_ml/tfrecord_reader.py track_data_export/<date> ensemble \
+  --num-models 5 \
+  --bagging-fraction 0.8 \
+  --seed-base 123 \
+  # disable if you prefer raw probabilities
+  # --no-temperature-scale
+
+# Break plateaus with optimizer/schedule/loss tweaks
+uv run src/imt_ml/tfrecord_reader.py track_data_export/<date> ensemble \
+  --optimizer adamw --weight-decay 1e-4 --clipnorm 1.0 \
+  --warmup-epochs 5 --cosine-restarts --restart-initial-period 15 \
+  --label-smoothing 0.05 --swa --swa-fraction 0.3
 ```
 
 ### Cross-Validation
@@ -238,6 +252,15 @@ Each training mode saves:
 Loading notes:
 - For inference, load checkpoints with `compile=False` to skip optimizer restore.
 - During tuning, best checkpoints include optimizer state to support resume; for inference use `compile=False`.
+- Ensemble training now saves best checkpoints and final per-model artifacts with optimizer state included. This supports resuming training or fine-tuning individual ensemble members. For inference, still load with `compile=False`.
+ - Ensemble training adds validation-based temperature scaling for better-calibrated probabilities (persisted in `{model_path}_temperature.json`). Control with `--no-temperature-scale`.
+ - Additional diversity options: per-model shuffle seeds (`--seed-base`) and bagging-lite via `--bagging-fraction` to decorrelate ensemble members.
+  - Training-time options to fight plateaus and improve generalization:
+    - Optimizer: `--optimizer adam|adamw`, `--clipnorm`, `--weight-decay` (for AdamW)
+    - Scheduling: `--warmup-epochs`, `--cosine-restarts`, `--restart-initial-period`, `--restart-multiplier`
+    - Losses: `--loss ce|focal`, `--label-smoothing`, `--focal-gamma`, `--focal-alpha`
+    - SWA: `--swa`, `--swa-fraction`
+    - Mixup: `--mixup-alpha` (applies to training batches; switches to categorical loss automatically)
 
 #### Output Directory Configuration
 

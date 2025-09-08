@@ -27,6 +27,155 @@ from imt_ml.models import (
 )
 
 
+# ----------------------
+# Helpers: optimizers, losses, mixup, SWA
+# ----------------------
+
+def _build_optimizer(
+    name: str,
+    learning_rate: float,
+    *,
+    weight_decay: float | None = None,
+    clipnorm: float | None = None,
+):
+    kwargs: dict[str, Any] = {}
+    if clipnorm is not None and clipnorm > 0:
+        kwargs["clipnorm"] = float(clipnorm)
+
+    if name.lower() == "adamw":
+        wd = float(weight_decay or 0.0)
+        return keras.optimizers.AdamW(learning_rate=learning_rate, weight_decay=wd, **kwargs)
+    # default Adam
+    return keras.optimizers.Adam(learning_rate=learning_rate, **kwargs)
+
+
+def _sparse_categorical_focal_loss(
+    num_classes: int,
+    gamma: float = 2.0,
+    alpha: float | None = None,
+):
+    eps = 1e-7
+
+    def loss_fn(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+        y_true = tf.cast(y_true, tf.int32)
+        y_pred = tf.clip_by_value(y_pred, eps, 1.0 - eps)
+        # gather p_t
+        idx = tf.stack([tf.range(tf.shape(y_true)[0]), tf.squeeze(y_true)], axis=1)
+        p_t = tf.gather_nd(y_pred, idx)
+        if alpha is not None:
+            alpha_t = tf.fill(tf.shape(p_t), float(alpha))
+            loss = -alpha_t * tf.pow(1.0 - p_t, gamma) * tf.math.log(p_t)
+        else:
+            loss = -tf.pow(1.0 - p_t, gamma) * tf.math.log(p_t)
+        return tf.reduce_mean(loss)
+
+    return loss_fn
+
+
+def _categorical_focal_loss(
+    gamma: float = 2.0,
+    alpha: float | None = None,
+):
+    eps = 1e-7
+
+    def loss_fn(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+        y_pred = tf.clip_by_value(y_pred, eps, 1.0 - eps)
+        p_t = tf.reduce_sum(y_true * y_pred, axis=-1)
+        if alpha is not None:
+            alpha_t = tf.fill(tf.shape(p_t), float(alpha))
+            loss = -alpha_t * tf.pow(1.0 - p_t, gamma) * tf.math.log(p_t)
+        else:
+            loss = -tf.pow(1.0 - p_t, gamma) * tf.math.log(p_t)
+        return tf.reduce_mean(loss)
+
+    return loss_fn
+
+
+def _build_loss(
+    *,
+    num_classes: int,
+    use_mixup: bool,
+    loss_type: str = "ce",
+    label_smoothing: float = 0.0,
+    focal_gamma: float = 2.0,
+    focal_alpha: float | None = None,
+):
+    if use_mixup:
+        # With mixup we use categorical labels
+        if loss_type == "focal":
+            print("Mixup with focal loss is not supported; using categorical crossentropy.")
+        return keras.losses.CategoricalCrossentropy(label_smoothing=label_smoothing)
+    else:
+        if loss_type == "focal":
+            return _sparse_categorical_focal_loss(
+                num_classes, gamma=focal_gamma, alpha=focal_alpha
+            )
+        # Sparse CE: Keras' SparseCategoricalCrossentropy may not accept label_smoothing
+        # in some versions. Implement smoothing via one-hot then CategoricalCrossentropy.
+        if label_smoothing and label_smoothing > 0.0:
+            cce = keras.losses.CategoricalCrossentropy(label_smoothing=label_smoothing)
+
+            def loss_fn(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+                y_true_oh = tf.one_hot(tf.cast(y_true, tf.int32), depth=num_classes)
+                return cce(y_true_oh, y_pred)
+
+            return loss_fn
+        return keras.losses.SparseCategoricalCrossentropy()
+
+
+def _make_mixup_mapper(num_classes: int, alpha: float, seed: int = 123):
+    cont_keys = [
+        "hour_sin",
+        "hour_cos",
+        "minute_sin",
+        "minute_cos",
+        "day_sin",
+        "day_cos",
+        "scheduled_timestamp",
+    ]
+    cat_keys = ["station_id", "route_id", "direction_id"]
+
+    def _beta(shape):
+        g1 = tf.random.gamma(shape, alpha, seed=seed)
+        g2 = tf.random.gamma(shape, alpha, seed=seed + 1)
+        return g1 / (g1 + g2)
+
+    def mapper(features: dict[str, tf.Tensor], labels: tf.Tensor):
+        batch_size = tf.shape(labels)[0]
+        # Permutation for pairing
+        idx = tf.random.shuffle(tf.range(batch_size), seed=seed)
+        lam = _beta((batch_size, 1))
+
+        # Mix continuous features
+        mixed: dict[str, tf.Tensor] = {}
+        for k in cont_keys:
+            if k in features:
+                a = tf.cast(features[k], tf.float32)
+                b = tf.gather(a, idx, axis=0)
+                mixed[k] = lam * a + (1.0 - lam) * b
+
+        # For categorical indices, randomly take from a or b
+        for k in cat_keys:
+            if k in features:
+                a = features[k]
+                b = tf.gather(a, idx, axis=0)
+                chooser = tf.less(tf.random.uniform(tf.shape(a), seed=seed), tf.squeeze(lam))
+                mixed[k] = tf.where(chooser, a, b)
+
+        # Ensure all original keys exist
+        for k, v in features.items():
+            if k not in mixed:
+                mixed[k] = v
+
+        # Mix labels (one-hot)
+        y1 = tf.one_hot(tf.cast(labels, tf.int32), depth=num_classes)
+        y2 = tf.gather(y1, idx, axis=0)
+        y_mix = lam * y1 + (1.0 - lam) * y2
+        return mixed, y_mix
+
+    return mapper
+
+
 def _maybe_import_ray_train() -> tuple[Any, Any, Any] | None:
     """Lazily import ray.train TensorFlow trainer and configs.
 
@@ -338,6 +487,7 @@ def tune_hyperparameters(
             monitor="val_accuracy",
             save_best_only=True,
             verbose=1,
+            mode="max",
         ),
     ]
 
@@ -889,6 +1039,15 @@ def _create_optimized_callbacks(
     use_scheduler: bool = True,
     scheduler_tmax: int = 50,
     use_early_stopping: bool = True,
+    include_optimizer_in_checkpoints: bool = False,
+    monitor_metric: str = "val_accuracy",
+    monitor_mode: str = "max",
+    # advanced scheduling
+    base_lr: float | None = None,
+    warmup_epochs: int = 0,
+    cosine_restarts: bool = False,
+    restart_initial_period: int = 10,
+    restart_mult: float = 2.0,
 ) -> list[keras.callbacks.Callback]:
     """Create optimized callbacks for small datasets."""
     # Adjust patience based on dataset size
@@ -921,37 +1080,93 @@ def _create_optimized_callbacks(
         if reduce_lr_patience is None
         else reduce_lr_patience
     )
-    callbacks.append(
-        keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss",
-            factor=reduce_lr_factor,
-            patience=rlrop_patience,
-            min_lr=min_lr,
-            verbose=1,
-            min_delta=min_delta,
-        )
-    )
-
-    callbacks.append(
-        _ModelCheckpointNoOptimizer(
-            filepath=f"{model_save_path}_best.keras",
-            monitor="val_accuracy",
-            save_best_only=True,
-            verbose=1,
-        )
-    )
-
-    if use_scheduler:
-        # Cosine annealing scheduler with configurable period; scales from current lr
+    if not cosine_restarts:
         callbacks.append(
-            keras.callbacks.LearningRateScheduler(
-                lambda epoch, lr: lr
-                * (0.5 * (1 + np.cos(np.pi * epoch / scheduler_tmax))),
+            keras.callbacks.ReduceLROnPlateau(
+                monitor="val_loss",
+                factor=reduce_lr_factor,
+                patience=rlrop_patience,
+                min_lr=min_lr,
                 verbose=1,
+                min_delta=min_delta,
             )
         )
 
+    if include_optimizer_in_checkpoints:
+        # Save checkpoints with optimizer state included (useful for resuming training)
+        callbacks.append(
+            keras.callbacks.ModelCheckpoint(
+                filepath=f"{model_save_path}_best.keras",
+                monitor=monitor_metric,
+                save_best_only=True,
+                verbose=1,
+                mode=monitor_mode,
+            )
+        )
+    else:
+        callbacks.append(
+            _ModelCheckpointNoOptimizer(
+                filepath=f"{model_save_path}_best.keras",
+                monitor=monitor_metric,
+                save_best_only=True,
+                verbose=1,
+                mode=monitor_mode,
+            )
+        )
+
+    if use_scheduler:
+        # Learning rate schedule: optional warmup plus either single cosine or cosine restarts
+        def _lr_schedule(epoch: int, current_lr: float) -> float:
+            blr = base_lr if base_lr is not None else current_lr
+            e = epoch
+            # Warmup phase
+            if warmup_epochs > 0 and e < warmup_epochs:
+                return float(blr * (e + 1) / max(1, warmup_epochs))
+
+            e_adj = e - warmup_epochs
+            if cosine_restarts:
+                # Cosine restarts: period grows by restart_mult
+                period = restart_initial_period
+                epoch_in_cycle = e_adj
+                while epoch_in_cycle >= period:
+                    epoch_in_cycle -= period
+                    period = int(max(1, round(period * restart_mult)))
+                cos_inner = np.pi * (epoch_in_cycle / max(1, period))
+                return float(blr * 0.5 * (1 + np.cos(cos_inner)))
+            else:
+                # Single cosine over scheduler_tmax
+                cos_inner = np.pi * (e_adj / max(1, scheduler_tmax))
+                return float(blr * 0.5 * (1 + np.cos(cos_inner)))
+
+        callbacks.append(
+            keras.callbacks.LearningRateScheduler(_lr_schedule, verbose=1)
+        )
+
     return callbacks
+
+
+class _StochasticWeightAveraging(keras.callbacks.Callback):  # type: ignore[misc]
+    def __init__(self, start_epoch: int) -> None:
+        super().__init__()
+        self.start_epoch = start_epoch
+        self.n = 0
+        self.avg_weights: list[np.ndarray] | None = None
+
+    def on_epoch_end(self, epoch: int, logs: dict[str, float] | None = None) -> None:
+        if epoch + 1 < self.start_epoch:
+            return
+        weights = self.model.get_weights()
+        if self.avg_weights is None:
+            self.avg_weights = [w.copy() for w in weights]
+            self.n = 1
+        else:
+            self.n += 1
+            for i in range(len(weights)):
+                self.avg_weights[i] = (self.avg_weights[i] * (self.n - 1) + weights[i]) / self.n
+
+    def on_train_end(self, logs: dict[str, float] | None = None) -> None:
+        if self.avg_weights is not None:
+            self.model.set_weights(self.avg_weights)
 
 
 def train_model(
@@ -962,6 +1177,21 @@ def train_model(
     model_save_path: str = "track_prediction_model",
     use_class_weights: bool = True,
     generate_report_func=None,
+    *,
+    optimizer_name: str = "adam",
+    weight_decay: float = 0.0,
+    clipnorm: float | None = None,
+    label_smoothing: float = 0.0,
+    loss_type: str = "ce",
+    focal_gamma: float = 2.0,
+    focal_alpha: float | None = None,
+    mixup_alpha: float = 0.0,
+    swa: bool = False,
+    swa_fraction: float = 0.3,
+    warmup_epochs: int = 0,
+    cosine_restarts: bool = False,
+    restart_initial_period: int = 10,
+    restart_mult: float = 2.0,
 ) -> Any:
     """Train the track prediction model with optimizations for small datasets."""
     start_time = time.time()
@@ -1020,19 +1250,48 @@ def train_model(
         adaptive_lr = learning_rate * (
             0.5 if vocab_info["metadata"]["total_records"] < 5000 else 1.0
         )
-        optimizer = keras.optimizers.Adam(
-            learning_rate=adaptive_lr,
-            beta_1=0.9,
-            beta_2=0.999,
-            epsilon=1e-7,  # Smaller epsilon for better precision
+        optimizer = _build_optimizer(
+            optimizer_name,
+            adaptive_lr,
+            weight_decay=weight_decay,
+            clipnorm=clipnorm,
         )
 
-        # Compile with class weights if requested
-        compile_kwargs = {
-            "optimizer": optimizer,
-            "loss": "sparse_categorical_crossentropy",
-            "metrics": ["accuracy", "top_k_categorical_accuracy"],
-        }
+        # Optionally apply mixup on the training dataset
+        use_mixup = mixup_alpha is not None and mixup_alpha > 0.0
+        per_model_train_ds = train_ds
+        per_model_val_ds = val_ds
+        if use_mixup:
+            print(f"Applying mixup with alpha={mixup_alpha} to training batches")
+            mix_mapper = _make_mixup_mapper(vocab_info["num_tracks"], mixup_alpha)
+            per_model_train_ds = per_model_train_ds.map(
+                mix_mapper, num_parallel_calls=tf.data.AUTOTUNE
+            )
+            # One-hot labels for validation when using categorical loss
+            per_model_val_ds = per_model_val_ds.map(
+                lambda x, y: (x, tf.one_hot(tf.cast(y, tf.int32), depth=vocab_info["num_tracks"])),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+
+        # Build loss
+        loss_obj = _build_loss(
+            num_classes=vocab_info["num_tracks"],
+            use_mixup=use_mixup,
+            loss_type=loss_type,
+            label_smoothing=label_smoothing,
+            focal_gamma=focal_gamma,
+            focal_alpha=focal_alpha,
+        )
+
+        # Compile with metrics matched to label format
+        if use_mixup:
+            metrics: list[str] = ["categorical_accuracy", "top_k_categorical_accuracy"]
+        else:
+            metrics = [
+                "sparse_categorical_accuracy",
+                "sparse_top_k_categorical_accuracy",
+            ]
+        compile_kwargs = {"optimizer": optimizer, "loss": loss_obj, "metrics": metrics}
 
         model.compile(**compile_kwargs)
 
@@ -1040,15 +1299,33 @@ def train_model(
 
         # Setup optimized callbacks
         dataset_size = vocab_info["metadata"]["total_records"]
-        callbacks = _create_optimized_callbacks(
-            model_save_path, dataset_size, epochs=epochs
+        # Choose appropriate validation metric name for checkpointing
+        monitor_metric = (
+            "val_categorical_accuracy" if use_mixup else "val_sparse_categorical_accuracy"
         )
+        callbacks = _create_optimized_callbacks(
+            model_save_path,
+            dataset_size,
+            epochs=epochs,
+            base_lr=adaptive_lr,
+            warmup_epochs=warmup_epochs,
+            cosine_restarts=cosine_restarts,
+            restart_initial_period=restart_initial_period,
+            restart_mult=restart_mult,
+            monitor_metric=monitor_metric,
+            monitor_mode="max",
+        )
+
+        # SWA
+        if swa:
+            start_epoch = max(1, int(epochs * (1 - max(0.0, min(1.0, swa_fraction)))))
+            callbacks.append(_StochasticWeightAveraging(start_epoch=start_epoch))
 
         # Train model with class weights for imbalanced data
         print(f"Training model for {epochs} epochs...")
         fit_kwargs = {
-            "x": train_ds,
-            "validation_data": val_ds,
+            "x": per_model_train_ds,
+            "validation_data": per_model_val_ds,
             "epochs": epochs,
             "steps_per_epoch": vocab_info["train_steps_per_epoch"],
             "validation_steps": vocab_info["val_steps_per_epoch"],
@@ -1253,6 +1530,23 @@ def train_ensemble_model(
     use_scheduler: bool = True,
     scheduler_tmax: int = 50,
     use_early_stopping: bool = True,
+    temperature_scale: bool = True,
+    seed_base: int = 42,
+    bagging_fraction: float = 1.0,
+    optimizer_name: str = "adam",
+    weight_decay: float = 0.0,
+    clipnorm: float | None = None,
+    label_smoothing: float = 0.0,
+    loss_type: str = "ce",
+    focal_gamma: float = 2.0,
+    focal_alpha: float | None = None,
+    mixup_alpha: float = 0.0,
+    swa: bool = False,
+    swa_fraction: float = 0.3,
+    warmup_epochs: int = 0,
+    cosine_restarts: bool = False,
+    restart_initial_period: int = 10,
+    restart_mult: float = 2.0,
 ) -> list[keras.Model]:
     """Train ensemble of models for improved accuracy on small datasets."""
     start_time = time.time()
@@ -1285,14 +1579,35 @@ def train_ensemble_model(
         adaptive_lr = learning_rate * (
             0.8 + 0.4 * np.random.random()
         )  # Vary learning rates
-        optimizer = keras.optimizers.Adam(learning_rate=adaptive_lr)
-        model.compile(
-            optimizer=optimizer,
-            loss="sparse_categorical_crossentropy",
-            metrics=["accuracy"],
+        optimizer = _build_optimizer(
+            optimizer_name, adaptive_lr, weight_decay=weight_decay, clipnorm=clipnorm
         )
+        use_mixup = mixup_alpha is not None and mixup_alpha > 0.0
+        loss_obj = _build_loss(
+            num_classes=vocab_info["num_tracks"],
+            use_mixup=use_mixup,
+            loss_type=loss_type,
+            label_smoothing=label_smoothing,
+            focal_gamma=focal_gamma,
+            focal_alpha=focal_alpha,
+        )
+        if use_mixup:
+            ens_metrics: list[str] = [
+                "categorical_accuracy",
+                "top_k_categorical_accuracy",
+            ]
+        else:
+            ens_metrics = [
+                "sparse_categorical_accuracy",
+                "sparse_top_k_categorical_accuracy",
+            ]
+        model.compile(optimizer=optimizer, loss=loss_obj, metrics=ens_metrics)
 
         # Setup callbacks
+        # Choose appropriate validation metric name for checkpointing
+        monitor_metric = (
+            "val_categorical_accuracy" if use_mixup else "val_sparse_categorical_accuracy"
+        )
         callbacks = _create_optimized_callbacks(
             f"{model_save_path}_model_{i}",
             dataset_size,
@@ -1305,14 +1620,47 @@ def train_ensemble_model(
             use_scheduler=use_scheduler,
             scheduler_tmax=scheduler_tmax,
             use_early_stopping=use_early_stopping,
+            include_optimizer_in_checkpoints=True,
+            base_lr=adaptive_lr,
+            warmup_epochs=warmup_epochs,
+            cosine_restarts=cosine_restarts,
+            restart_initial_period=restart_initial_period,
+            restart_mult=restart_mult,
+            monitor_metric=monitor_metric,
+            monitor_mode="max",
         )
 
+        if swa:
+            start_epoch = max(1, int(epochs * (1 - max(0.0, min(1.0, swa_fraction)))))
+            callbacks.append(_StochasticWeightAveraging(start_epoch=start_epoch))
+
+        # Optionally add per-model shuffle for diversity and bagging-like behavior
+        per_model_train_ds = train_ds.shuffle(
+            buffer_size=min(10000, dataset_size),
+            seed=seed_base + i,
+            reshuffle_each_iteration=True,
+        )
+
+        # Adjust steps per epoch for bagging fraction
+        steps_per_epoch = max(1, int(vocab_info["train_steps_per_epoch"] * bagging_fraction))
+
         # Train model
+        # If using mixup (categorical loss), provide one-hot labels for validation
+        val_ds_for_fit = val_ds
+        if use_mixup:
+            val_ds_for_fit = val_ds.map(
+                lambda x, y: (
+                    x,
+                    tf.one_hot(tf.cast(y, tf.int32), depth=vocab_info["num_tracks"]),
+                ),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+
         fit_kwargs = {
-            "x": train_ds,
-            "validation_data": val_ds,
+            "x": per_model_train_ds,
+            "validation_data": val_ds_for_fit,
             "epochs": epochs,
-            "steps_per_epoch": vocab_info["train_steps_per_epoch"],
+            "steps_per_epoch": steps_per_epoch,
             "validation_steps": vocab_info["val_steps_per_epoch"],
             "callbacks": callbacks,
             "verbose": 1,
@@ -1321,13 +1669,45 @@ def train_ensemble_model(
         if "class_weights" in vocab_info:
             fit_kwargs["class_weight"] = vocab_info["class_weights"]
 
+        # Optionally apply mixup to per-model dataset
+        if use_mixup:
+            mix_mapper = _make_mixup_mapper(vocab_info["num_tracks"], mixup_alpha, seed=seed_base + i)
+            per_model_train_ds = per_model_train_ds.map(
+                mix_mapper, num_parallel_calls=tf.data.AUTOTUNE
+            )
+            fit_kwargs["x"] = per_model_train_ds
+
         model.fit(**fit_kwargs)
 
         # Evaluate individual model
         # val_ds repeats indefinitely; bound evaluation by known validation steps
-        val_loss, val_accuracy = model.evaluate(
-            val_ds, steps=vocab_info["val_steps_per_epoch"], verbose=1
+        eval_ds = val_ds
+        if use_mixup:
+            eval_ds = val_ds.map(
+                lambda x, y: (
+                    x,
+                    tf.one_hot(tf.cast(y, tf.int32), depth=vocab_info["num_tracks"]),
+                ),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+        eval_out = model.evaluate(
+            eval_ds, steps=vocab_info["val_steps_per_epoch"], verbose=1
         )
+        if isinstance(eval_out, (list, tuple)):
+            val_loss = float(eval_out[0])
+            # First metric after loss is the accuracy metric we compiled
+            val_accuracy = float(eval_out[1]) if len(eval_out) > 1 else float("nan")
+        elif isinstance(eval_out, dict):
+            val_loss = float(eval_out.get("loss", float("nan")))
+            # Try common keys
+            val_accuracy = float(
+                eval_out.get("sparse_categorical_accuracy",
+                             eval_out.get("categorical_accuracy", float("nan")))
+            )
+        else:
+            # Fallback if backend returns scalar loss only
+            val_loss = float(eval_out)
+            val_accuracy = float("nan")
         individual_metrics.append(
             {
                 "model_index": i,
@@ -1339,13 +1719,14 @@ def train_ensemble_model(
         )
 
         # Save individual model
-        model.save(f"{model_save_path}_model_{i}_final.keras", include_optimizer=False)
+        model.save(f"{model_save_path}_model_{i}_final.keras", include_optimizer=True)
         trained_models.append(model)
         tqdm.write(f"Model {i + 1} completed - Accuracy: {val_accuracy:.4f}")
 
     # Evaluate ensemble
     print("\nEvaluating ensemble performance...")
     ensemble_predictions = []
+    y_true_list: list[int] = []
 
     for model in tqdm(
         trained_models, desc="Evaluating ensemble models", unit="model", leave=False
@@ -1355,6 +1736,28 @@ def train_ensemble_model(
             val_ds, steps=vocab_info["val_steps_per_epoch"], verbose=1
         )
         ensemble_predictions.append(predictions)
+
+    # Collect true labels for the same number of validation steps
+    for batch_idx, batch in enumerate(val_ds):
+        try:
+            if isinstance(batch, tuple) or isinstance(batch, list):
+                if len(batch) >= 2:
+                    y_batch = batch[1]
+                else:
+                    continue
+            else:
+                # Unexpected structure; skip
+                continue
+            y_true_list.extend(list(y_batch.numpy().astype(int)))
+        except Exception:
+            # Be defensive in case dataset yields (x,y,sw) or other shapes
+            try:
+                y_batch = batch[1]
+                y_true_list.extend(list(tf.cast(y_batch, tf.int32).numpy()))
+            except Exception:
+                pass
+        if batch_idx + 1 >= vocab_info["val_steps_per_epoch"]:
+            break
 
     # Calculate ensemble metrics
     ensemble_training_time = time.time() - start_time
@@ -1368,6 +1771,71 @@ def train_ensemble_model(
     print(f"Average individual accuracy: {avg_val_accuracy:.4f}")
     print(f"Best individual accuracy: {best_individual_accuracy:.4f}")
 
+    # Optional: Temperature scaling for better-calibrated probabilities
+    calibration_info: dict[str, Any] | None = None
+    if temperature_scale and len(ensemble_predictions) > 0 and len(y_true_list) > 0:
+        def _apply_temperature(probs: np.ndarray, T: float) -> np.ndarray:
+            eps = 1e-8
+            logp = np.log(np.clip(probs, eps, 1.0))
+            scaled = logp / max(T, 1e-6)
+            scaled = scaled - np.max(scaled, axis=1, keepdims=True)
+            expv = np.exp(scaled)
+            return expv / np.sum(expv, axis=1, keepdims=True)
+
+        def _nll(y_true: np.ndarray, probs: np.ndarray) -> float:
+            eps = 1e-8
+            idx = np.arange(len(y_true))
+            return float(-np.mean(np.log(np.clip(probs[idx, y_true], eps, 1.0))))
+
+        preds_arr = np.array(ensemble_predictions)  # [M, N, C]
+        avg_probs = np.mean(preds_arr, axis=0)  # [N, C]
+        y_true_np = np.array(y_true_list[: len(avg_probs)], dtype=int)
+
+        # Grid-search temperature on validation
+        grid = np.linspace(0.5, 3.0, 26)
+        best_T = 1.0
+        best_nll = float("inf")
+        for T in grid:
+            nll = _nll(y_true_np, _apply_temperature(avg_probs, T))
+            if nll < best_nll:
+                best_nll = nll
+                best_T = float(T)
+
+        calibrated_probs = _apply_temperature(avg_probs, best_T)
+        # Also compute ECE (expected calibration error) as a sanity check
+        def _ece(y_true: np.ndarray, probs: np.ndarray, n_bins: int = 15) -> float:
+            confidences = probs.max(axis=1)
+            predictions = probs.argmax(axis=1)
+            accuracies = (predictions == y_true).astype(float)
+            bins = np.linspace(0.0, 1.0, n_bins + 1)
+            ece = 0.0
+            for b in range(n_bins):
+                m = (confidences > bins[b]) & (confidences <= bins[b + 1])
+                if np.any(m):
+                    ece += abs(accuracies[m].mean() - confidences[m].mean()) * m.mean()
+            return float(ece)
+
+        uncal_nll = _nll(y_true_np, avg_probs)
+        cal_nll = _nll(y_true_np, calibrated_probs)
+        uncal_ece = _ece(y_true_np, avg_probs)
+        cal_ece = _ece(y_true_np, calibrated_probs)
+
+        calibration_info = {
+            "temperature": best_T,
+            "uncalibrated_nll": uncal_nll,
+            "calibrated_nll": cal_nll,
+            "uncalibrated_ece": uncal_ece,
+            "calibrated_ece": cal_ece,
+        }
+
+        # Persist temperature to JSON for serving-time use
+        try:
+            import json as _json
+            with open(f"{model_save_path}_temperature.json", "w") as f:
+                _json.dump({"ensemble_temperature": best_T}, f, indent=2)
+        except Exception:
+            pass
+
     # Generate ensemble training report if function provided
     if generate_report_func:
         training_params = {
@@ -1376,6 +1844,8 @@ def train_ensemble_model(
             "batch_size": batch_size,
             "base_learning_rate": learning_rate,
             "dataset_size": dataset_size,
+            "bagging_fraction": bagging_fraction,
+            "seed_base": seed_base,
         }
 
         final_metrics = {
@@ -1396,6 +1866,9 @@ def train_ensemble_model(
             "learning_rate_variation": "0.8x to 1.2x base rate with random variation",
             "total_parameters": sum([m["parameters"] for m in individual_metrics]),
         }
+
+        if calibration_info is not None:
+            additional_info["temperature_scaling"] = calibration_info
 
         generate_report_func(
             "ensemble",
